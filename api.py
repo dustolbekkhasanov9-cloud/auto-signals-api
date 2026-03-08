@@ -277,10 +277,26 @@ async def manual_refresh():
     }
 
 @app.get("/history")
-def get_history(limit: int = Query(default=50)):
+def get_history(limit: int = 50):
+    now_utc = datetime.now(timezone.utc)
+    closed_items = []
+
+    for item in signal_history:
+        exit_time_iso = item.get("exit_time_iso", "")
+        if not exit_time_iso:
+            continue
+
+        try:
+            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        if exit_dt <= now_utc:
+            closed_items.append(item)
+
     return {
-        "items": signal_history[:limit],
-        "count": len(signal_history),
+        "items": closed_items[:limit],
+        "count": len(closed_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
     }
