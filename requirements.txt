@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pandas
+requests
+yfinance
+openpyxl
+beautifulsoup4
+matplotlib
+numpy
