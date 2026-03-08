@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import requests
 import pandas as pd
 import yfinance as yf
@@ -26,7 +26,7 @@ def fetch_data(symbol: str, days: int = 30, interval: str = PRIMARY_TF) -> pd.Da
         quote = result["indicators"]["quote"][0]
 
         df = pd.DataFrame(quote)
-        df["Date"] = pd.to_datetime(ts, unit="s")
+        df["Date"] = pd.to_datetime(ts, unit="s", utc=True)
         df.set_index("Date", inplace=True)
         df.rename(
             columns={
@@ -53,7 +53,13 @@ def fetch_data(symbol: str, days: int = 30, interval: str = PRIMARY_TF) -> pd.Da
             )
             if df is None or df.empty:
                 return None
+
             df = df.rename(columns=lambda c: c.capitalize())
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+
             df.dropna(inplace=True)
             return df
         except Exception:
@@ -102,6 +108,8 @@ def analyze_symbol(symbol: str) -> dict:
             "chart_labels": [],
             "entry_time": "Нет сигнала",
             "exit_time": "Нет сигнала",
+            "entry_time_iso": "",
+            "exit_time_iso": "",
             "reason": "Недостаточно данных",
         }
 
@@ -180,6 +188,7 @@ def analyze_symbol(symbol: str) -> dict:
         raw_confidence = 0
 
     confidence = min(round(raw_confidence, 1), 95.0)
+    reason = "; ".join(reasons) if reasons else "Нет оснований"
 
     if signal == "NONE":
         entry_price = None
@@ -187,6 +196,8 @@ def analyze_symbol(symbol: str) -> dict:
         sl = None
         entry_time = "Нет сигнала"
         exit_time = "Нет сигнала"
+        entry_time_iso = ""
+        exit_time_iso = ""
     else:
         now_utc = datetime.now(timezone.utc)
         next_hour_utc = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -200,7 +211,6 @@ def analyze_symbol(symbol: str) -> dict:
         entry_time_iso = entry_dt_utc.isoformat().replace("+00:00", "Z")
         exit_time_iso = exit_dt_utc.isoformat().replace("+00:00", "Z")
 
-        # цена входа: текущая цена как базовый ориентир стратегии
         entry_price = price
 
         if signal == "BUY":
@@ -220,7 +230,7 @@ def analyze_symbol(symbol: str) -> dict:
         "entry_price": entry_price,
         "signal": signal,
         "confidence": confidence,
-        "rsi": rsi_value,
+        "rsi": rsi,
         "tp": tp,
         "sl": sl,
         "market_regime": market_regime,
