@@ -21,6 +21,9 @@ DEFAULT_SYMBOLS = [
     "EURJPY=X",
 ]
 
+DEFAULT_TIMEFRAME = "1h"
+DEFAULT_DURATION_TYPE = "short"
+
 REFRESH_SECONDS = 30
 
 signal_cache: Dict[str, Dict[str, Any]] = {}
@@ -35,31 +38,28 @@ def now_iso() -> str:
 def make_error_payload(symbol: str, reason: str) -> dict:
     return {
         "symbol": symbol,
-        "price": None,
-        "entry_price": None,
         "signal": "NONE",
         "confidence": 0.0,
-        "rsi": None,
-        "tp": None,
-        "sl": None,
-        "market_regime": "UNKNOWN",
-        "chart_prices": [],
-        "chart_labels": [],
-        "entry_time": "Нет сигнала",
-        "exit_time": "Нет сигнала",
         "reason": reason,
     }
 
 
 async def analyze_symbol_safe(symbol: str) -> dict:
     try:
-        # analyze_symbol синхронная функция, поэтому уводим в отдельный поток
-        result = await asyncio.to_thread(analyze_symbol, symbol)
+        result = await asyncio.to_thread(
+            analyze_symbol,
+            symbol,
+            DEFAULT_TIMEFRAME,
+            DEFAULT_DURATION_TYPE,
+        )
+
         if not isinstance(result, dict):
             return make_error_payload(symbol, "Некорректный ответ анализа")
+
         return result
+
     except Exception as e:
-        logger.exception("Ошибка анализа символа %s: %s", symbol, e)
+        logger.exception("Ошибка анализа %s: %s", symbol, e)
         return make_error_payload(symbol, f"Ошибка анализа: {str(e)}")
 
 
@@ -67,10 +67,12 @@ async def refresh_all_signals() -> None:
     global signal_cache, last_updated_at, last_refresh_status
 
     logger.info("Обновление сигналов началось")
+
     tasks = [analyze_symbol_safe(symbol) for symbol in DEFAULT_SYMBOLS]
     results = await asyncio.gather(*tasks)
 
     new_cache: Dict[str, Dict[str, Any]] = {}
+
     for item in results:
         symbol = item.get("symbol")
         if symbol:
@@ -80,7 +82,7 @@ async def refresh_all_signals() -> None:
         signal_cache = new_cache
         last_updated_at = now_iso()
         last_refresh_status = "ok"
-        logger.info("Обновление сигналов завершено: %s символов", len(signal_cache))
+        logger.info("Сигналы обновлены: %s", len(signal_cache))
     else:
         last_refresh_status = "error"
         logger.warning("Обновление сигналов не дало результатов")
@@ -103,7 +105,6 @@ async def background_refresh_loop() -> None:
 async def lifespan(app: FastAPI):
     app.state.refresh_task = asyncio.create_task(background_refresh_loop())
 
-    # первый прогрев сразу при старте
     try:
         await refresh_all_signals()
     except Exception as e:
@@ -112,6 +113,7 @@ async def lifespan(app: FastAPI):
     yield
 
     refresh_task = getattr(app.state, "refresh_task", None)
+
     if refresh_task:
         refresh_task.cancel()
         try:
@@ -146,28 +148,62 @@ def health():
 
 
 @app.get("/signal")
-def get_signal(symbol: str = Query(default="EURUSD=X")):
-    if symbol in signal_cache:
-        return signal_cache[symbol]
+def get_signal(
+    symbol: str = Query(default="EURUSD=X"),
+    timeframe: str = Query(default=DEFAULT_TIMEFRAME),
+    duration_type: str = Query(default=DEFAULT_DURATION_TYPE),
+):
 
-    # если символ не из стандартного списка — можно посчитать отдельно
+    # если пользователь запрашивает нестандартный символ
     if symbol not in DEFAULT_SYMBOLS:
-        result = analyze_symbol(symbol)
-        return result
+        return analyze_symbol(symbol, timeframe, duration_type)
 
-    raise HTTPException(status_code=503, detail="Сигнал еще не готов, попробуй через несколько секунд")
+    # если стандартный — берем из кэша
+    if symbol in signal_cache:
+        cached = signal_cache[symbol].copy()
+
+        # если пользователь указал другой таймфрейм — пересчитываем
+        if timeframe != DEFAULT_TIMEFRAME or duration_type != DEFAULT_DURATION_TYPE:
+            return analyze_symbol(symbol, timeframe, duration_type)
+
+        return cached
+
+    raise HTTPException(
+        status_code=503,
+        detail="Сигнал еще не готов, попробуй через несколько секунд",
+    )
 
 
 @app.get("/signals")
-def get_signals():
-    items = [signal_cache[symbol] for symbol in DEFAULT_SYMBOLS if symbol in signal_cache]
+def get_signals(
+    timeframe: str = Query(default=DEFAULT_TIMEFRAME),
+    duration_type: str = Query(default=DEFAULT_DURATION_TYPE),
+):
+
+    if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
+        items = [signal_cache[s] for s in DEFAULT_SYMBOLS if s in signal_cache]
+
+        return {
+            "items": items,
+            "meta": {
+                "last_updated_at": last_updated_at,
+                "last_refresh_status": last_refresh_status,
+                "refresh_seconds": REFRESH_SECONDS,
+                "count": len(items),
+            },
+        }
+
+    # если пользователь выбрал другой таймфрейм — считаем на лету
+    items = [
+        analyze_symbol(symbol, timeframe, duration_type)
+        for symbol in DEFAULT_SYMBOLS
+    ]
 
     return {
         "items": items,
         "meta": {
-            "last_updated_at": last_updated_at,
-            "last_refresh_status": last_refresh_status,
-            "refresh_seconds": REFRESH_SECONDS,
+            "timeframe": timeframe,
+            "duration_type": duration_type,
             "count": len(items),
         },
     }
@@ -176,6 +212,7 @@ def get_signals():
 @app.post("/refresh")
 async def manual_refresh():
     await refresh_all_signals()
+
     return {
         "status": "ok",
         "message": "Сигналы обновлены вручную",
