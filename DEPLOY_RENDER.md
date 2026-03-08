@@ -89,3 +89,5 @@ let apiBaseURL = "https://YOUR-RENDER-URL.onrender.com"
 - После перехода на `https://` блок `NSAppTransportSecurity / NSAllowsArbitraryLoads` обычно больше не нужен.
 - Бесплатный план может «засыпать». Первый запрос после простоя может открываться дольше.
 - Если Render выдаст ошибку по зависимостям, проверь, что в репозитории лежит именно обновленный `requirements.txt`.
+
+
