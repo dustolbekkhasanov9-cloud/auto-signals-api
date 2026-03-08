@@ -9,6 +9,14 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 
 DEFAULT_TIMEFRAME = "1h"
+HIGHER_TIMEFRAME_MAP = {
+    "5m": "15m",
+    "10m": "30m",
+    "15m": "1h",
+    "30m": "1h",
+    "1h": "1d",
+    "1d": None,
+}
 DEFAULT_DURATION_TYPE = "short"
 
 TIMEFRAME_CONFIG = {
@@ -70,7 +78,16 @@ def empty_signal_payload(symbol: str, reason: str, timeframe: str = DEFAULT_TIME
         "tp": None,
         "sl": None,
         "market_regime": "UNKNOWN",
+        "higher_timeframe_bias": "NONE",
         "strategy": "Нет сигнала",
+
+        "candle_buy_bonus": 0.0,
+        "candle_sell_bonus": 0.0,
+        "level_buy_bonus": 0.0,
+        "level_sell_bonus": 0.0,
+        "trend_strength": 0.0,
+        "volatility_ratio": 0.0,
+
         "recommended_expiry": "",
         "chart_prices": [],
         "chart_labels": [],
@@ -276,6 +293,62 @@ def detect_market_regime(df: pd.DataFrame) -> str:
     if ema20 < ema50 and atr_ratio >= 0.0015:
         return "DOWNTREND"
     return "RANGE"
+
+
+def detect_trend_bias(df: pd.DataFrame) -> str:
+    if df is None or df.empty or len(df) < 20:
+        return "NONE"
+
+    last = df.iloc[-1]
+
+    price = float(last["Close"])
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    macd = float(last["MACD"])
+    macd_signal = float(last["MACD_SIGNAL"])
+
+    buy_votes = 0
+    sell_votes = 0
+
+    if ema20 > ema50:
+        buy_votes += 1
+    elif ema20 < ema50:
+        sell_votes += 1
+
+    if price > ema20:
+        buy_votes += 1
+    elif price < ema20:
+        sell_votes += 1
+
+    if macd > macd_signal:
+        buy_votes += 1
+    elif macd < macd_signal:
+        sell_votes += 1
+
+    if buy_votes >= 2 and buy_votes > sell_votes:
+        return "BUY"
+
+    if sell_votes >= 2 and sell_votes > buy_votes:
+        return "SELL"
+
+    return "NONE"
+
+
+def get_higher_timeframe_bias(symbol: str, timeframe: str) -> str:
+    higher_tf = HIGHER_TIMEFRAME_MAP.get(timeframe)
+
+    if not higher_tf:
+        return "NONE"
+
+    higher_df = fetch_data(symbol, timeframe=higher_tf)
+    if higher_df is None or len(higher_df) < 60:
+        return "NONE"
+
+    higher_df = build_indicators(higher_df)
+    if higher_df is None or higher_df.empty or len(higher_df) < 30:
+        return "NONE"
+
+    return detect_trend_bias(higher_df)
 
 
 def make_strategy_result(name: str, signal: str = "NONE", score: float = 0.0, reasons: list[str] | None = None) -> dict[str, Any]:
@@ -516,9 +589,96 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["HA_Close"] = ha["HA_Close"]
     df["HA_High"] = ha["HA_High"]
     df["HA_Low"] = ha["HA_Low"]
+    df["ATR_SLOW"] = df["ATR"].rolling(20).mean()
+    df["VOLATILITY_RATIO"] = (df["ATR"] / df["ATR_SLOW"]).replace([float("inf"), -float("inf")], 0)
+    df["EMA_GAP"] = (df["EMA20"] - df["EMA50"]).abs()
+    df["TREND_STRENGTH"] = (df["EMA_GAP"] / df["ATR"]).replace([float("inf"), -float("inf")], 0)
 
     df.dropna(inplace=True)
     return df
+def get_candle_confirmation_bonus(df: pd.DataFrame) -> tuple[float, float]:
+    if df is None or df.empty or len(df) < 2:
+        return 0.0, 0.0
+
+    last = df.iloc[-1]
+
+    open_price = float(last["Open"])
+    close_price = float(last["Close"])
+    high_price = float(last["High"])
+    low_price = float(last["Low"])
+    atr = float(last["ATR"]) if "ATR" in df.columns else 0.0
+
+    candle_range = max(high_price - low_price, 1e-10)
+    body = abs(close_price - open_price)
+    body_ratio = body / candle_range
+
+    upper_wick = high_price - max(open_price, close_price)
+    lower_wick = min(open_price, close_price) - low_price
+
+    buy_bonus = 0.0
+    sell_bonus = 0.0
+
+    # сильная бычья свеча
+    if close_price > open_price and body_ratio >= 0.55:
+        buy_bonus += 4.0
+
+    # сильная медвежья свеча
+    if close_price < open_price and body_ratio >= 0.55:
+        sell_bonus += 4.0
+
+    # длинная нижняя тень = возможный отскок вверх
+    if lower_wick > body * 1.2 and lower_wick > upper_wick:
+        buy_bonus += 2.0
+
+    # длинная верхняя тень = возможный отбой вниз
+    if upper_wick > body * 1.2 and upper_wick > lower_wick:
+        sell_bonus += 2.0
+
+    # дополнительный бонус, если свеча реально заметная относительно ATR
+    if atr > 0:
+        candle_vs_atr = candle_range / atr
+        if candle_vs_atr >= 0.8:
+            if close_price > open_price:
+                buy_bonus += 2.0
+            elif close_price < open_price:
+                sell_bonus += 2.0
+
+    return buy_bonus, sell_bonus
+def get_level_proximity_bonus(df: pd.DataFrame) -> tuple[float, float]:
+    if df is None or df.empty or len(df) < 30:
+        return 0.0, 0.0
+
+    last = df.iloc[-1]
+    recent = df.iloc[-25:-1]
+
+    price = float(last["Close"])
+    low_price = float(last["Low"])
+    high_price = float(last["High"])
+    atr = float(last["ATR"]) if "ATR" in df.columns else 0.0
+
+    if atr <= 0:
+        return 0.0, 0.0
+
+    support = float(recent["Low"].min())
+    resistance = float(recent["High"].max())
+
+    buy_bonus = 0.0
+    sell_bonus = 0.0
+
+    support_distance = abs(low_price - support) / atr
+    resistance_distance = abs(high_price - resistance) / atr
+
+    if support_distance <= 0.25:
+        buy_bonus += 4.0
+    elif support_distance <= 0.50:
+        buy_bonus += 2.0
+
+    if resistance_distance <= 0.25:
+        sell_bonus += 4.0
+    elif resistance_distance <= 0.50:
+        sell_bonus += 2.0
+
+    return buy_bonus, sell_bonus
 
 
 def round_time_for_timeframe(now_utc: datetime, timeframe: str) -> datetime:
@@ -577,39 +737,147 @@ def format_expiry_label(delta: timedelta) -> str:
     return f"{days}d"
 
 
-def combine_strategy_results(results: list[dict[str, Any]], market_regime: str) -> tuple[str, float, str, str]:
-    buy_score = sum(float(r["score"]) for r in results if r["signal"] == "BUY")
-    sell_score = sum(float(r["score"]) for r in results if r["signal"] == "SELL")
+def combine_strategy_results(
+    results: list[dict[str, Any]],
+    market_regime: str,
+    higher_timeframe_bias: str = "NONE",
+    candle_buy_bonus: float = 0.0,
+    candle_sell_bonus: float = 0.0,
+    level_buy_bonus: float = 0.0,
+    level_sell_bonus: float = 0.0,
+) -> tuple[str, float, str, str]:
+    adjusted_results = []
+
+    for r in results:
+        item = dict(r)
+        score = float(item["score"])
+        name = item["name"]
+        volatility_ratio = float(item.get("volatility_ratio", 1.0))
+        trend_strength = float(item.get("trend_strength", 1.0))
+
+        if market_regime in ("UPTREND", "DOWNTREND"):
+            if name in ("EMA Pullback", "MACD Momentum"):
+                score *= 1.18
+            elif name == "Heikin Ashi Trend":
+                score *= 1.10
+            elif name in ("RSI Reversal", "Bollinger Reversal"):
+                score *= 0.94
+        if name == "Breakout":
+            if volatility_ratio >= 1.15:
+                score *= 1.18
+            elif volatility_ratio >= 1.05:
+                score *= 1.08
+        if name in ("EMA Pullback", "MACD Momentum", "Heikin Ashi Trend"):
+            if trend_strength >= 1.8:
+                score *= 1.20
+            elif trend_strength >= 1.2:
+                score *= 1.10
+            elif trend_strength <= 0.7:
+                score *= 0.92
+
+        if name in ("RSI Reversal", "Bollinger Reversal"):
+            if volatility_ratio >= 1.20:
+                score *= 0.90
+            elif volatility_ratio <= 0.95:
+                score *= 1.06
+
+        elif market_regime in ("FLAT", "RANGE"):
+            if name in ("RSI Reversal", "Bollinger Reversal", "Support Bounce", "Resistance Bounce", "Support/Resistance"):
+                score *= 1.18
+            elif name in ("EMA Pullback", "MACD Momentum"):
+                score *= 0.94
+            elif name == "Breakout":
+                score *= 0.96
+
+        if market_regime != "FLAT" and name == "Breakout":
+            score *= 1.08
+
+        item["score"] = round(score, 2)
+        adjusted_results.append(item)
+
+    buy_score = sum(float(r["score"]) for r in adjusted_results if r["signal"] == "BUY")
+    sell_score = sum(float(r["score"]) for r in adjusted_results if r["signal"] == "SELL")
+    buy_score += candle_buy_bonus
+    sell_score += candle_sell_bonus
+    buy_score += level_buy_bonus
+    sell_score += level_sell_bonus
+    buy_count = sum(1 for r in adjusted_results if r["signal"] == "BUY")
+    sell_count = sum(1 for r in adjusted_results if r["signal"] == "SELL")
+
+    if buy_count >= 3:
+        buy_score += 6
+    elif buy_count == 2:
+        buy_score += 3
+
+    if sell_count >= 3:
+        sell_score += 6
+    elif sell_count == 2:
+        sell_score += 3
 
     if market_regime == "FLAT":
         buy_score *= 0.88
         sell_score *= 0.88
 
+    if higher_timeframe_bias == "BUY":
+        buy_score += 8
+        sell_score -= 2
+    elif higher_timeframe_bias == "SELL":
+        sell_score += 8
+        buy_score -= 2
+
+    buy_score = max(buy_score, 0.0)
+    sell_score = max(sell_score, 0.0)
+
     if buy_score > sell_score:
         signal = "BUY"
         winning_score = buy_score
         losing_score = sell_score
-        winning_strategies = [r["name"] for r in results if r["signal"] == "BUY"]
-        winning_reasons = [reason for r in results if r["signal"] == "BUY" for reason in r["reasons"]]
+        winning_strategies = [r["name"] for r in adjusted_results if r["signal"] == "BUY"]
+        winning_reasons = [reason for r in adjusted_results if r["signal"] == "BUY" for reason in r["reasons"]]
     elif sell_score > buy_score:
         signal = "SELL"
         winning_score = sell_score
         losing_score = buy_score
-        winning_strategies = [r["name"] for r in results if r["signal"] == "SELL"]
-        winning_reasons = [reason for r in results if r["signal"] == "SELL" for reason in r["reasons"]]
+        winning_strategies = [r["name"] for r in adjusted_results if r["signal"] == "SELL"]
+        winning_reasons = [reason for r in adjusted_results if r["signal"] == "SELL" for reason in r["reasons"]]
     else:
         return "NONE", 0.0, "Нет сигнала", "Недостаточно оснований"
 
     spread = max(winning_score - losing_score, 0.0)
-    confidence = min(round(winning_score + spread * 0.35, 1), 95.0)
+
+    conflict_penalty = 0.0
+    total_score = winning_score + losing_score
+
+    if total_score > 0:
+        conflict_ratio = losing_score / total_score
+
+        if conflict_ratio >= 0.45:
+            conflict_penalty = 8.0
+        elif conflict_ratio >= 0.35:
+            conflict_penalty = 5.0
+        elif conflict_ratio >= 0.25:
+            conflict_penalty = 2.5
+
+    confidence = min(
+        round(winning_score + spread * 0.35 - conflict_penalty, 1),
+        95.0
+    )
+    confidence = max(confidence, 0.0)
 
     strategy_name = " + ".join(winning_strategies[:3]) if winning_strategies else "Нет сигнала"
-    reason_text = "; ".join(dict.fromkeys(winning_reasons)) if winning_reasons else "Нет оснований"
+
+    reason_parts = list(dict.fromkeys(winning_reasons))
+    if higher_timeframe_bias == signal:
+        reason_parts.append(f"Старший ТФ подтверждает {signal}")
+    elif higher_timeframe_bias != "NONE" and higher_timeframe_bias != signal:
+        reason_parts.append(f"Старший ТФ против текущего сигнала ({higher_timeframe_bias})")
+
+    reason_text = "; ".join(reason_parts) if reason_parts else "Нет оснований"
 
     return signal, confidence, strategy_name, reason_text
 
-
 def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_type: str = DEFAULT_DURATION_TYPE) -> dict:
+
     timeframe = normalize_timeframe(timeframe)
     duration_type = normalize_duration_type(duration_type)
 
@@ -624,8 +892,15 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
     last = df.iloc[-1]
     price = float(last["Close"])
     rsi = float(last["RSI"])
+
     atr = float(last["ATR"])
     market_regime = detect_market_regime(df)
+    higher_timeframe_bias = get_higher_timeframe_bias(symbol, timeframe)
+    candle_buy_bonus, candle_sell_bonus = get_candle_confirmation_bonus(df)
+    level_buy_bonus, level_sell_bonus = get_level_proximity_bonus(df)
+
+    current_volatility_ratio = float(last["VOLATILITY_RATIO"]) if "VOLATILITY_RATIO" in df.columns else 1.0
+    current_trend_strength = float(last["TREND_STRENGTH"]) if "TREND_STRENGTH" in df.columns else 1.0
 
     strategy_results = [
         strategy_ema_pullback(df),
@@ -637,7 +912,19 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
         strategy_support_resistance(df),
     ]
 
-    signal, confidence, strategy_name, reason = combine_strategy_results(strategy_results, market_regime)
+    for item in strategy_results:
+        item["volatility_ratio"] = current_volatility_ratio
+        item["trend_strength"] = current_trend_strength
+
+    signal, confidence, strategy_name, reason = combine_strategy_results(
+        strategy_results,
+        market_regime,
+        higher_timeframe_bias,
+        candle_buy_bonus,
+        candle_sell_bonus,
+        level_buy_bonus,
+        level_sell_bonus,
+    )
 
     if signal == "NONE":
         entry_price = None
@@ -695,7 +982,14 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
         "tp": round(float(tp), 5) if tp is not None else None,
         "sl": round(float(sl), 5) if sl is not None else None,
         "market_regime": market_regime,
+        "higher_timeframe_bias": higher_timeframe_bias,
         "strategy": strategy_name,
+	"candle_buy_bonus": candle_buy_bonus,
+	"candle_sell_bonus": candle_sell_bonus,
+	"level_buy_bonus": level_buy_bonus,
+	"level_sell_bonus": level_sell_bonus,
+	"trend_strength": current_trend_strength,
+	"volatility_ratio": current_volatility_ratio,
         "recommended_expiry": recommended_expiry,
         "chart_prices": chart_prices,
         "chart_labels": chart_labels,
