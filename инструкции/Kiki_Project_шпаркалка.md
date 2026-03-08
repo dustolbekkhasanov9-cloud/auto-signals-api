@@ -289,8 +289,9 @@ https://auto-signals-api.onrender.com/signals
 Xcode → Command + B
 изменил сервер
 cd ~/Kiki/Облако
+cd ~/Kiki/Облако
 git add .
-git commit -m "update"
+git commit -m "improve signal engine accuracy"
 git push
 
 

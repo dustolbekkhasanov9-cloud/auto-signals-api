@@ -74,6 +74,7 @@ def empty_signal_payload(symbol: str, reason: str, timeframe: str = DEFAULT_TIME
         "entry_price": None,
         "signal": "NONE",
         "confidence": 0.0,
+	"signal_quality": 0.0,
         "rsi": None,
         "tp": None,
         "sl": None,
@@ -745,7 +746,7 @@ def combine_strategy_results(
     candle_sell_bonus: float = 0.0,
     level_buy_bonus: float = 0.0,
     level_sell_bonus: float = 0.0,
-) -> tuple[str, float, str, str]:
+) -> tuple[str, float, float, str, str]:
     adjusted_results = []
 
     for r in results:
@@ -797,6 +798,15 @@ def combine_strategy_results(
 
     buy_score = sum(float(r["score"]) for r in adjusted_results if r["signal"] == "BUY")
     sell_score = sum(float(r["score"]) for r in adjusted_results if r["signal"] == "SELL")
+    buy_count = sum(1 for r in adjusted_results if r["signal"] == "BUY")
+    sell_count = sum(1 for r in adjusted_results if r["signal"] == "SELL")
+
+    total_votes = buy_count + sell_count
+
+    if total_votes == 0:
+        quality_score = 0
+    else:
+        quality_score = min(100, round((max(buy_score, sell_score) / (total_votes * 20)) * 100, 1))
     buy_score += candle_buy_bonus
     sell_score += candle_sell_bonus
     buy_score += level_buy_bonus
@@ -841,7 +851,7 @@ def combine_strategy_results(
         winning_strategies = [r["name"] for r in adjusted_results if r["signal"] == "SELL"]
         winning_reasons = [reason for r in adjusted_results if r["signal"] == "SELL" for reason in r["reasons"]]
     else:
-        return "NONE", 0.0, "Нет сигнала", "Недостаточно оснований"
+        return "NONE", 0.0, 0.0, "Нет сигнала", "Недостаточно оснований"
 
     spread = max(winning_score - losing_score, 0.0)
 
@@ -858,10 +868,10 @@ def combine_strategy_results(
         elif conflict_ratio >= 0.25:
             conflict_penalty = 2.5
 
-    confidence = min(
-        round(winning_score + spread * 0.35 - conflict_penalty, 1),
-        95.0
-    )
+    confidence = round(
+        (winning_score * 0.6) +
+        (quality_score * 0.4),
+    1)
     confidence = max(confidence, 0.0)
 
     strategy_name = " + ".join(winning_strategies[:3]) if winning_strategies else "Нет сигнала"
@@ -874,7 +884,7 @@ def combine_strategy_results(
 
     reason_text = "; ".join(reason_parts) if reason_parts else "Нет оснований"
 
-    return signal, confidence, strategy_name, reason_text
+    return signal, confidence, quality_score, strategy_name, reason_text
 
 def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_type: str = DEFAULT_DURATION_TYPE) -> dict:
 
@@ -916,7 +926,7 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
         item["volatility_ratio"] = current_volatility_ratio
         item["trend_strength"] = current_trend_strength
 
-    signal, confidence, strategy_name, reason = combine_strategy_results(
+    signal, confidence, quality_score, strategy_name, reason = combine_strategy_results(
         strategy_results,
         market_regime,
         higher_timeframe_bias,
@@ -978,6 +988,7 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
         "entry_price": entry_price,
         "signal": signal,
         "confidence": confidence,
+	"signal_quality": quality_score,
         "rsi": round(rsi, 2),
         "tp": round(float(tp), 5) if tp is not None else None,
         "sl": round(float(sl), 5) if sl is not None else None,
