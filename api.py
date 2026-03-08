@@ -29,6 +29,8 @@ REFRESH_SECONDS = 30
 signal_cache: Dict[str, Dict[str, Any]] = {}
 last_updated_at: str | None = None
 last_refresh_status: str = "starting"
+signal_history: list[dict] = []
+MAX_HISTORY_ITEMS = 300
 
 
 def now_iso() -> str:
@@ -42,7 +44,60 @@ def make_error_payload(symbol: str, reason: str) -> dict:
         "confidence": 0.0,
         "reason": reason,
     }
+def add_signals_to_history(items: list[dict]) -> None:
+    global signal_history
 
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        signal = item.get("signal", "NONE")
+        symbol = item.get("symbol", "")
+        timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
+        duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
+        entry_time_iso = item.get("entry_time_iso", "")
+        strategy = item.get("strategy", "")
+
+        if signal == "NONE":
+            continue
+
+        history_item = {
+            "symbol": symbol,
+            "signal": signal,
+            "confidence": item.get("confidence", 0.0),
+            "signal_quality": item.get("signal_quality", 0.0),
+            "price": item.get("price"),
+            "entry_price": item.get("entry_price"),
+            "tp": item.get("tp"),
+            "sl": item.get("sl"),
+            "market_regime": item.get("market_regime", "UNKNOWN"),
+            "higher_timeframe_bias": item.get("higher_timeframe_bias", "NONE"),
+            "strategy": strategy,
+            "timeframe": timeframe,
+            "duration_type": duration_type,
+            "recommended_expiry": item.get("recommended_expiry", ""),
+            "entry_time": item.get("entry_time", ""),
+            "exit_time": item.get("exit_time", ""),
+            "entry_time_iso": entry_time_iso,
+            "exit_time_iso": item.get("exit_time_iso", ""),
+            "reason": item.get("reason", ""),
+            "saved_at": now_iso(),
+        }
+
+        duplicate_exists = any(
+            h.get("symbol") == symbol
+            and h.get("signal") == signal
+            and h.get("timeframe") == timeframe
+            and h.get("duration_type") == duration_type
+            and h.get("entry_time_iso") == entry_time_iso
+            and h.get("strategy") == strategy
+            for h in signal_history
+        )
+
+        if not duplicate_exists:
+            signal_history.insert(0, history_item)
+
+    signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
 async def analyze_symbol_safe(symbol: str) -> dict:
     try:
@@ -82,6 +137,7 @@ async def refresh_all_signals() -> None:
         signal_cache = new_cache
         last_updated_at = now_iso()
         last_refresh_status = "ok"
+        add_signals_to_history(results)
         logger.info("Сигналы обновлены: %s", len(signal_cache))
     else:
         last_refresh_status = "error"
@@ -218,4 +274,13 @@ async def manual_refresh():
         "message": "Сигналы обновлены вручную",
         "last_updated_at": last_updated_at,
         "count": len(signal_cache),
+    }
+
+@app.get("/history")
+def get_history(limit: int = Query(default=50)):
+    return {
+        "items": signal_history[:limit],
+        "count": len(signal_history),
+        "limit": limit,
+        "last_updated_at": last_updated_at,
     }
