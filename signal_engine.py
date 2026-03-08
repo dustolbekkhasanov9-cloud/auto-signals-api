@@ -188,10 +188,17 @@ def analyze_symbol(symbol: str) -> dict:
         entry_time = "Нет сигнала"
         exit_time = "Нет сигнала"
     else:
-        now = datetime.now()
-        next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        entry_time = next_hour.strftime("%H:%M")
-        exit_time = (next_hour + timedelta(hours=2)).strftime("%H:%M")
+        now_utc = datetime.now(timezone.utc)
+        next_hour_utc = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+        entry_dt_utc = next_hour_utc
+        exit_dt_utc = next_hour_utc + timedelta(hours=2)
+
+        entry_time = entry_dt_utc.strftime("%H:%M")
+        exit_time = exit_dt_utc.strftime("%H:%M")
+
+        entry_time_iso = entry_dt_utc.isoformat().replace("+00:00", "Z")
+        exit_time_iso = exit_dt_utc.isoformat().replace("+00:00", "Z")
 
         # цена входа: текущая цена как базовый ориентир стратегии
         entry_price = price
@@ -209,17 +216,19 @@ def analyze_symbol(symbol: str) -> dict:
 
     return {
         "symbol": symbol,
-        "price": round(price, 5),
-        "entry_price": round(entry_price, 5) if entry_price is not None else None,
+        "price": price,
+        "entry_price": entry_price,
         "signal": signal,
         "confidence": confidence,
-        "rsi": round(rsi, 1),
-        "tp": round(tp, 5) if tp is not None else None,
-        "sl": round(sl, 5) if sl is not None else None,
+        "rsi": rsi_value,
+        "tp": tp,
+        "sl": sl,
         "market_regime": market_regime,
         "chart_prices": chart_prices,
         "chart_labels": chart_labels,
         "entry_time": entry_time,
         "exit_time": exit_time,
-        "reason": "; ".join(reasons),
+        "entry_time_iso": entry_time_iso,
+        "exit_time_iso": exit_time_iso,
+        "reason": reason,
     }
