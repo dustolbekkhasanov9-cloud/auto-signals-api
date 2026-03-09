@@ -73,6 +73,7 @@ def add_signals_to_active(items: list[dict]) -> None:
             "entry_price": item.get("entry_price"),
             "tp": item.get("tp"),
             "sl": item.get("sl"),
+            "rsi": item.get("rsi", 0.0),
             "market_regime": item.get("market_regime", "UNKNOWN"),
             "higher_timeframe_bias": item.get("higher_timeframe_bias", "NONE"),
             "strategy": strategy,
@@ -83,8 +84,16 @@ def add_signals_to_active(items: list[dict]) -> None:
             "exit_time": item.get("exit_time", ""),
             "entry_time_iso": entry_time_iso,
             "exit_time_iso": item.get("exit_time_iso", ""),
-            "result": "OPEN",
             "reason": item.get("reason", ""),
+            "chart_prices": item.get("chart_prices", []),
+            "chart_labels": item.get("chart_labels", []),
+            "candle_buy_bonus": item.get("candle_buy_bonus", 0.0),
+            "candle_sell_bonus": item.get("candle_sell_bonus", 0.0),
+            "level_buy_bonus": item.get("level_buy_bonus", 0.0),
+            "level_sell_bonus": item.get("level_sell_bonus", 0.0),
+            "trend_strength": item.get("trend_strength", 0.0),
+            "volatility_ratio": item.get("volatility_ratio", 0.0),
+            "result": "OPEN",
             "saved_at": now_iso(),
         }
 
@@ -126,6 +135,7 @@ def add_signals_to_history(items: list[dict]) -> None:
             "entry_price": item.get("entry_price"),
             "tp": item.get("tp"),
             "sl": item.get("sl"),
+            "rsi": item.get("rsi", 0.0),
             "market_regime": item.get("market_regime", "UNKNOWN"),
             "higher_timeframe_bias": item.get("higher_timeframe_bias", "NONE"),
             "strategy": strategy,
@@ -136,8 +146,16 @@ def add_signals_to_history(items: list[dict]) -> None:
             "exit_time": item.get("exit_time", ""),
             "entry_time_iso": entry_time_iso,
             "exit_time_iso": item.get("exit_time_iso", ""),
-            "result": "OPEN",
             "reason": item.get("reason", ""),
+            "chart_prices": item.get("chart_prices", []),
+            "chart_labels": item.get("chart_labels", []),
+            "candle_buy_bonus": item.get("candle_buy_bonus", 0.0),
+            "candle_sell_bonus": item.get("candle_sell_bonus", 0.0),
+            "level_buy_bonus": item.get("level_buy_bonus", 0.0),
+            "level_sell_bonus": item.get("level_sell_bonus", 0.0),
+            "trend_strength": item.get("trend_strength", 0.0),
+            "volatility_ratio": item.get("volatility_ratio", 0.0),
+            "result": "OPEN",
             "saved_at": now_iso(),
         }
 
@@ -262,18 +280,24 @@ async def refresh_all_signals() -> None:
         if symbol:
             new_cache[symbol] = item
 
-    if new_cache:
-        signal_cache = new_cache
-        last_updated_at = now_iso()
-        last_refresh_status = "ok"
+        if new_cache:
+            signal_cache = new_cache
+            last_updated_at = now_iso()
+            last_refresh_status = "ok"
 
-        add_signals_to_active(results)
-        update_closed_history_results()
+            # сохраняем найденные сигналы
+            add_signals_to_active(results)
 
-        logger.info("Сигналы обновлены: %s", len(signal_cache))
-    else:
-        last_refresh_status = "error"
-        logger.warning("Обновление сигналов не дало результатов")
+            # сохраняем их снимок в историю
+            add_signals_to_history(results)
+
+            # проверяем какие сигналы уже закрылись
+            update_closed_history_results()
+
+            logger.info("Сигналы обновлены: %s", len(signal_cache))
+        else:
+            last_refresh_status = "error"
+            logger.warning("Обновление сигналов не дало результатов")
 
 
 async def background_refresh_loop() -> None:
