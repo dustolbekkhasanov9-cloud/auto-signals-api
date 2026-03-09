@@ -268,7 +268,6 @@ async def refresh_all_signals() -> None:
         last_refresh_status = "ok"
 
         add_signals_to_active(results)
-        add_signals_to_history(results)
         update_closed_history_results()
 
         logger.info("Сигналы обновлены: %s", len(signal_cache))
@@ -397,6 +396,19 @@ def get_signals(
         },
     }
 
+@app.get("/active_signals")
+def get_active_signals(limit: int = 50):
+    open_items = [
+        item for item in active_signals
+        if item.get("result") == "OPEN"
+    ]
+
+    return {
+        "items": open_items[:limit],
+        "count": len(open_items),
+        "limit": limit,
+        "last_updated_at": last_updated_at,
+    }
 
 @app.post("/refresh")
 async def manual_refresh():
