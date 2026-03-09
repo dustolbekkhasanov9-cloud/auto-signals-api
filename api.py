@@ -80,6 +80,7 @@ def add_signals_to_history(items: list[dict]) -> None:
             "exit_time": item.get("exit_time", ""),
             "entry_time_iso": entry_time_iso,
             "exit_time_iso": item.get("exit_time_iso", ""),
+            "result": "OPEN",
             "reason": item.get("reason", ""),
             "saved_at": now_iso(),
         }
@@ -98,6 +99,60 @@ def add_signals_to_history(items: list[dict]) -> None:
             signal_history.insert(0, history_item)
 
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
+def update_closed_history_results() -> None:
+    now_utc = datetime.now(timezone.utc)
+
+    for item in signal_history:
+        if item.get("result") != "OPEN":
+            continue
+
+        exit_time_iso = item.get("exit_time_iso", "")
+        if not exit_time_iso:
+            continue
+
+        try:
+            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        if exit_dt > now_utc:
+            continue
+
+        symbol = item.get("symbol")
+        timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
+        duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
+
+        if not symbol:
+            item["result"] = "CLOSED"
+            continue
+
+        try:
+            latest = analyze_symbol(symbol, timeframe, duration_type)
+        except Exception:
+            item["result"] = "CLOSED"
+            continue
+
+        current_price = latest.get("price")
+        entry_price = item.get("entry_price")
+        signal = item.get("signal")
+
+        if current_price is None or entry_price is None or signal not in ("BUY", "SELL"):
+            item["result"] = "CLOSED"
+            continue
+
+        try:
+            current_price = float(current_price)
+            entry_price = float(entry_price)
+        except Exception:
+            item["result"] = "CLOSED"
+            continue
+
+        if signal == "BUY":
+            item["result"] = "TP" if current_price >= entry_price else "SL"
+        elif signal == "SELL":
+            item["result"] = "TP" if current_price <= entry_price else "SL"
+        else:
+            item["result"] = "CLOSED"
 
 async def analyze_symbol_safe(symbol: str) -> dict:
     try:
@@ -138,6 +193,7 @@ async def refresh_all_signals() -> None:
         last_updated_at = now_iso()
         last_refresh_status = "ok"
         add_signals_to_history(results)
+        update_closed_history_results()
         logger.info("Сигналы обновлены: %s", len(signal_cache))
     else:
         last_refresh_status = "error"
@@ -278,21 +334,7 @@ async def manual_refresh():
 
 @app.get("/history")
 def get_history(limit: int = 50):
-    now_utc = datetime.now(timezone.utc)
-    closed_items = []
-
-    for item in signal_history:
-        exit_time_iso = item.get("exit_time_iso", "")
-        if not exit_time_iso:
-            continue
-
-        try:
-            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
-        except Exception:
-            continue
-
-        if exit_dt <= now_utc:
-            closed_items.append(item)
+    closed_items = [item for item in signal_history if item.get("result") == "CLOSED"]
 
     return {
         "items": closed_items[:limit],
