@@ -29,7 +29,10 @@ REFRESH_SECONDS = 30
 signal_cache: Dict[str, Dict[str, Any]] = {}
 last_updated_at: str | None = None
 last_refresh_status: str = "starting"
+
+active_signals: list[dict] = []
 signal_history: list[dict] = []
+
 MAX_HISTORY_ITEMS = 300
 
 
@@ -44,6 +47,59 @@ def make_error_payload(symbol: str, reason: str) -> dict:
         "confidence": 0.0,
         "reason": reason,
     }
+def add_signals_to_active(items: list[dict]) -> None:
+    global active_signals
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        signal = item.get("signal", "NONE")
+        symbol = item.get("symbol", "")
+        timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
+        duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
+        entry_time_iso = item.get("entry_time_iso", "")
+        strategy = item.get("strategy", "")
+
+        if signal not in ("BUY", "SELL"):
+            continue
+
+        active_item = {
+            "symbol": symbol,
+            "signal": signal,
+            "confidence": item.get("confidence", 0.0),
+            "signal_quality": item.get("signal_quality", 0.0),
+            "price": item.get("price"),
+            "entry_price": item.get("entry_price"),
+            "tp": item.get("tp"),
+            "sl": item.get("sl"),
+            "market_regime": item.get("market_regime", "UNKNOWN"),
+            "higher_timeframe_bias": item.get("higher_timeframe_bias", "NONE"),
+            "strategy": strategy,
+            "timeframe": timeframe,
+            "duration_type": duration_type,
+            "recommended_expiry": item.get("recommended_expiry", ""),
+            "entry_time": item.get("entry_time", ""),
+            "exit_time": item.get("exit_time", ""),
+            "entry_time_iso": entry_time_iso,
+            "exit_time_iso": item.get("exit_time_iso", ""),
+            "result": "OPEN",
+            "reason": item.get("reason", ""),
+            "saved_at": now_iso(),
+        }
+
+        duplicate_exists = any(
+            a.get("symbol") == symbol
+            and a.get("signal") == signal
+            and a.get("timeframe") == timeframe
+            and a.get("duration_type") == duration_type
+            and a.get("entry_time_iso") == entry_time_iso
+            and a.get("strategy") == strategy
+            for a in active_signals
+        )
+
+        if not duplicate_exists:
+            active_signals.insert(0, active_item)
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
 
@@ -100,22 +156,31 @@ def add_signals_to_history(items: list[dict]) -> None:
 
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
 def update_closed_history_results() -> None:
-    now_utc = datetime.now(timezone.utc)
+    global active_signals, signal_history
 
-    for item in signal_history:
+    now_utc = datetime.now(timezone.utc)
+    still_active: list[dict] = []
+
+    for item in active_signals:
         if item.get("result") != "OPEN":
+            still_active.append(item)
             continue
 
         exit_time_iso = item.get("exit_time_iso", "")
         if not exit_time_iso:
+            item["result"] = "CLOSED"
+            signal_history.insert(0, item)
             continue
 
         try:
             exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
         except Exception:
+            item["result"] = "CLOSED"
+            signal_history.insert(0, item)
             continue
 
         if exit_dt > now_utc:
+            still_active.append(item)
             continue
 
         symbol = item.get("symbol")
@@ -124,12 +189,14 @@ def update_closed_history_results() -> None:
 
         if not symbol:
             item["result"] = "CLOSED"
+            signal_history.insert(0, item)
             continue
 
         try:
             latest = analyze_symbol(symbol, timeframe, duration_type)
         except Exception:
             item["result"] = "CLOSED"
+            signal_history.insert(0, item)
             continue
 
         current_price = latest.get("price")
@@ -138,6 +205,7 @@ def update_closed_history_results() -> None:
 
         if current_price is None or entry_price is None or signal not in ("BUY", "SELL"):
             item["result"] = "CLOSED"
+            signal_history.insert(0, item)
             continue
 
         try:
@@ -145,6 +213,7 @@ def update_closed_history_results() -> None:
             entry_price = float(entry_price)
         except Exception:
             item["result"] = "CLOSED"
+            signal_history.insert(0, item)
             continue
 
         if signal == "BUY":
@@ -153,6 +222,11 @@ def update_closed_history_results() -> None:
             item["result"] = "TP" if current_price <= entry_price else "SL"
         else:
             item["result"] = "CLOSED"
+
+        signal_history.insert(0, item)
+
+    active_signals = still_active
+    signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
 async def analyze_symbol_safe(symbol: str) -> dict:
     try:
@@ -192,8 +266,11 @@ async def refresh_all_signals() -> None:
         signal_cache = new_cache
         last_updated_at = now_iso()
         last_refresh_status = "ok"
+
+        add_signals_to_active(results)
         add_signals_to_history(results)
         update_closed_history_results()
+
         logger.info("Сигналы обновлены: %s", len(signal_cache))
     else:
         last_refresh_status = "error"
@@ -334,7 +411,10 @@ async def manual_refresh():
 
 @app.get("/history")
 def get_history(limit: int = 50):
-    closed_items = [item for item in signal_history if item.get("result") == "CLOSED"]
+    closed_items = [
+        item for item in signal_history
+        if item.get("result") in ("TP", "SL", "CLOSED")
+    ]
 
     return {
         "items": closed_items[:limit],
