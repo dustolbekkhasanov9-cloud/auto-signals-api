@@ -64,6 +64,8 @@ def add_signals_to_active(items: list[dict]) -> None:
         if signal not in ("BUY", "SELL"):
             continue
 
+        signal_id = f"{symbol}_{signal}_{timeframe}_{entry_time_iso}"
+
         active_item = {
             "symbol": symbol,
             "signal": signal,
@@ -98,12 +100,7 @@ def add_signals_to_active(items: list[dict]) -> None:
         }
 
         duplicate_exists = any(
-            a.get("symbol") == symbol
-            and a.get("signal") == signal
-            and a.get("timeframe") == timeframe
-            and a.get("duration_type") == duration_type
-            and a.get("entry_time_iso") == entry_time_iso
-            and a.get("strategy") == strategy
+            a.get("id") == signal_id
             for a in active_signals
         )
 
