@@ -289,7 +289,6 @@ async def refresh_all_signals() -> None:
             add_signals_to_active(results)
 
             # сохраняем их снимок в историю
-            add_signals_to_history(results)
 
             # проверяем какие сигналы уже закрылись
             update_closed_history_results()
