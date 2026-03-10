@@ -17,6 +17,14 @@ HIGHER_TIMEFRAME_MAP = {
     "1h": "1d",
     "1d": None,
 }
+MULTI_TIMEFRAME_MAP = {
+    "5m": {"confirm": "15m", "trend": "1h"},
+    "10m": {"confirm": "30m", "trend": "1h"},
+    "15m": {"confirm": "1h", "trend": "1d"},
+    "30m": {"confirm": "1h", "trend": "1d"},
+    "1h": {"confirm": "1d", "trend": None},
+    "1d": {"confirm": None, "trend": None},
+}
 DEFAULT_DURATION_TYPE = "short"
 
 TIMEFRAME_CONFIG = {
@@ -74,12 +82,13 @@ def empty_signal_payload(symbol: str, reason: str, timeframe: str = DEFAULT_TIME
         "entry_price": None,
         "signal": "NONE",
         "confidence": 0.0,
-	"signal_quality": 0.0,
+        "signal_quality": 0.0,
         "rsi": None,
         "tp": None,
         "sl": None,
         "market_regime": "UNKNOWN",
-        "higher_timeframe_bias": "NONE",
+        "confirm_bias": "NONE",
+        "trend_bias": "NONE",
         "strategy": "Нет сигнала",
 
         "candle_buy_bonus": 0.0,
@@ -158,6 +167,7 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
 
         r = requests.get(url, headers=headers, timeout=12)
         data = r.json()
+        r.raise_for_status()
 
         result = data["chart"]["result"][0]
         ts = result["timestamp"]
@@ -349,8 +359,40 @@ def get_higher_timeframe_bias(symbol: str, timeframe: str) -> str:
     if higher_df is None or higher_df.empty or len(higher_df) < 30:
         return "NONE"
 
-    return detect_trend_bias(higher_df)
+    signal_df = higher_df.iloc[:-1].copy()
+    if signal_df.empty or len(signal_df) < 20:
+        return "NONE"
 
+    return detect_trend_bias(signal_df)
+    
+def get_timeframe_bias(symbol: str, timeframe: str | None) -> str:
+    if not timeframe:
+        return "NONE"
+
+    df = fetch_data(symbol, timeframe=timeframe)
+    if df is None or len(df) < 60:
+        return "NONE"
+
+    df = build_indicators(df)
+    if df is None or df.empty or len(df) < 30:
+        return "NONE"
+
+    signal_df = df.iloc[:-1].copy()
+    if signal_df.empty or len(signal_df) < 20:
+        return "NONE"
+
+    return detect_trend_bias(signal_df)
+
+def get_multi_timeframe_bias(symbol: str, timeframe: str) -> tuple[str, str]:
+    cfg = MULTI_TIMEFRAME_MAP.get(timeframe, {"confirm": None, "trend": None})
+
+    confirm_tf = cfg.get("confirm")
+    trend_tf = cfg.get("trend")
+
+    confirm_bias = get_timeframe_bias(symbol, confirm_tf)
+    trend_bias = get_timeframe_bias(symbol, trend_tf)
+
+    return confirm_bias, trend_bias
 
 def make_strategy_result(name: str, signal: str = "NONE", score: float = 0.0, reasons: list[str] | None = None) -> dict[str, Any]:
     return {
@@ -597,6 +639,7 @@ def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df.dropna(inplace=True)
     return df
+    
 def get_candle_confirmation_bonus(df: pd.DataFrame) -> tuple[float, float]:
     if df is None or df.empty or len(df) < 2:
         return 0.0, 0.0
@@ -611,6 +654,35 @@ def get_candle_confirmation_bonus(df: pd.DataFrame) -> tuple[float, float]:
 
     candle_range = max(high_price - low_price, 1e-10)
     body = abs(close_price - open_price)
+    body_ratio = body / candle_range
+
+    upper_wick = high_price - max(open_price, close_price)
+    lower_wick = min(open_price, close_price) - low_price
+
+    buy_bonus = 0.0
+    sell_bonus = 0.0
+
+    if close_price > open_price and body_ratio >= 0.55:
+        buy_bonus += 4.0
+
+    if close_price < open_price and body_ratio >= 0.55:
+        sell_bonus += 4.0
+
+    if lower_wick > body * 1.2 and lower_wick > upper_wick:
+        buy_bonus += 2.0
+
+    if upper_wick > body * 1.2 and upper_wick > lower_wick:
+        sell_bonus += 2.0
+
+    if atr > 0:
+        candle_vs_atr = candle_range / atr
+        if candle_vs_atr >= 0.8:
+            if close_price > open_price:
+                buy_bonus += 2.0
+            elif close_price < open_price:
+                sell_bonus += 2.0
+
+    return buy_bonus, sell_bonus
     body_ratio = body / candle_range
 
     upper_wick = high_price - max(open_price, close_price)
@@ -741,7 +813,8 @@ def format_expiry_label(delta: timedelta) -> str:
 def combine_strategy_results(
     results: list[dict[str, Any]],
     market_regime: str,
-    higher_timeframe_bias: str = "NONE",
+    confirm_bias: str = "NONE",
+    trend_bias: str = "NONE",
     candle_buy_bonus: float = 0.0,
     candle_sell_bonus: float = 0.0,
     level_buy_bonus: float = 0.0,
@@ -763,11 +836,21 @@ def combine_strategy_results(
                 score *= 1.10
             elif name in ("RSI Reversal", "Bollinger Reversal"):
                 score *= 0.94
+
+        if market_regime in ("FLAT", "RANGE"):
+            if name in ("RSI Reversal", "Bollinger Reversal", "Support Bounce", "Resistance Bounce", "Support/Resistance"):
+                score *= 1.18
+            elif name in ("EMA Pullback", "MACD Momentum"):
+                score *= 0.94
+            elif name == "Breakout":
+                score *= 0.96
+
         if name == "Breakout":
             if volatility_ratio >= 1.15:
                 score *= 1.18
             elif volatility_ratio >= 1.05:
                 score *= 1.08
+
         if name in ("EMA Pullback", "MACD Momentum", "Heikin Ashi Trend"):
             if trend_strength >= 1.8:
                 score *= 1.20
@@ -781,14 +864,6 @@ def combine_strategy_results(
                 score *= 0.90
             elif volatility_ratio <= 0.95:
                 score *= 1.06
-
-        elif market_regime in ("FLAT", "RANGE"):
-            if name in ("RSI Reversal", "Bollinger Reversal", "Support Bounce", "Resistance Bounce", "Support/Resistance"):
-                score *= 1.18
-            elif name in ("EMA Pullback", "MACD Momentum"):
-                score *= 0.94
-            elif name == "Breakout":
-                score *= 0.96
 
         if market_regime != "FLAT" and name == "Breakout":
             score *= 1.08
@@ -804,15 +879,12 @@ def combine_strategy_results(
     total_votes = buy_count + sell_count
 
     if total_votes == 0:
-        quality_score = 0
+        quality_score = 0.0
     else:
         quality_score = min(100, round((max(buy_score, sell_score) / (total_votes * 20)) * 100, 1))
-    buy_score += candle_buy_bonus
-    sell_score += candle_sell_bonus
-    buy_score += level_buy_bonus
-    sell_score += level_sell_bonus
-    buy_count = sum(1 for r in adjusted_results if r["signal"] == "BUY")
-    sell_count = sum(1 for r in adjusted_results if r["signal"] == "SELL")
+
+    buy_score += candle_buy_bonus + level_buy_bonus
+    sell_score += candle_sell_bonus + level_sell_bonus
 
     if buy_count >= 3:
         buy_score += 6
@@ -828,12 +900,19 @@ def combine_strategy_results(
         buy_score *= 0.88
         sell_score *= 0.88
 
-    if higher_timeframe_bias == "BUY":
-        buy_score += 8
-        sell_score -= 2
-    elif higher_timeframe_bias == "SELL":
-        sell_score += 8
-        buy_score -= 2
+    if confirm_bias == "BUY":
+        buy_score += 6
+        sell_score = max(sell_score - 1.5, 0.0)
+    elif confirm_bias == "SELL":
+        sell_score += 6
+        buy_score = max(buy_score - 1.5, 0.0)
+
+    if trend_bias == "BUY":
+        buy_score += 10
+        sell_score = max(sell_score - 2.5, 0.0)
+    elif trend_bias == "SELL":
+        sell_score += 10
+        buy_score = max(buy_score - 2.5, 0.0)
 
     buy_score = max(buy_score, 0.0)
     sell_score = max(sell_score, 0.0)
@@ -853,14 +932,11 @@ def combine_strategy_results(
     else:
         return "NONE", 0.0, 0.0, "Нет сигнала", "Недостаточно оснований"
 
-    spread = max(winning_score - losing_score, 0.0)
-
-    conflict_penalty = 0.0
     total_score = winning_score + losing_score
+    conflict_penalty = 0.0
 
     if total_score > 0:
         conflict_ratio = losing_score / total_score
-
         if conflict_ratio >= 0.45:
             conflict_penalty = 8.0
         elif conflict_ratio >= 0.35:
@@ -868,58 +944,70 @@ def combine_strategy_results(
         elif conflict_ratio >= 0.25:
             conflict_penalty = 2.5
 
-    confidence = round(
-        (winning_score * 0.6) +
-        (quality_score * 0.4),
-    1)
+    confidence = round((winning_score * 0.6) + (quality_score * 0.4) - conflict_penalty, 1)
     confidence = max(confidence, 0.0)
 
     strategy_name = " + ".join(winning_strategies[:3]) if winning_strategies else "Нет сигнала"
 
     reason_parts = list(dict.fromkeys(winning_reasons))
-    if higher_timeframe_bias == signal:
+
+    if confirm_bias == signal:
+        reason_parts.append(f"Средний ТФ подтверждает {signal}")
+    elif confirm_bias != "NONE" and confirm_bias != signal:
+        reason_parts.append(f"Средний ТФ против сигнала ({confirm_bias})")
+
+    if trend_bias == signal:
         reason_parts.append(f"Старший ТФ подтверждает {signal}")
-    elif higher_timeframe_bias != "NONE" and higher_timeframe_bias != signal:
-        reason_parts.append(f"Старший ТФ против текущего сигнала ({higher_timeframe_bias})")
+    elif trend_bias != "NONE" and trend_bias != signal:
+        reason_parts.append(f"Старший ТФ против сигнала ({trend_bias})")
 
     reason_text = "; ".join(reason_parts) if reason_parts else "Нет оснований"
 
     return signal, confidence, quality_score, strategy_name, reason_text
 
 def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_type: str = DEFAULT_DURATION_TYPE) -> dict:
-
     timeframe = normalize_timeframe(timeframe)
     duration_type = normalize_duration_type(duration_type)
 
     df = fetch_data(symbol, timeframe=timeframe)
-    if df is None or len(df) < 80:
+    MIN_BARS = 60
+
+    if df is None or df.empty or len(df) < MIN_BARS:
         return empty_signal_payload(symbol, "Недостаточно данных", timeframe, duration_type)
 
     df = build_indicators(df)
-    if df is None or df.empty or len(df) < 60:
+
+    if df is None or df.empty or len(df) < 30:
         return empty_signal_payload(symbol, "Недостаточно данных после расчёта индикаторов", timeframe, duration_type)
 
-    last = df.iloc[-1]
-    price = float(last["Close"])
+    # Используем закрытую свечу для расчёта сигнала, чтобы не было перерисовки
+    signal_df = df.iloc[:-1].copy()
+    if signal_df.empty or len(signal_df) < 30:
+        return empty_signal_payload(symbol, "Недостаточно закрытых свечей для анализа", timeframe, duration_type)
+
+    last = signal_df.iloc[-1]
+    market_candle = df.iloc[-1]
+
+    price = float(market_candle["Close"])
     rsi = float(last["RSI"])
-
     atr = float(last["ATR"])
-    market_regime = detect_market_regime(df)
-    higher_timeframe_bias = get_higher_timeframe_bias(symbol, timeframe)
-    candle_buy_bonus, candle_sell_bonus = get_candle_confirmation_bonus(df)
-    level_buy_bonus, level_sell_bonus = get_level_proximity_bonus(df)
 
-    current_volatility_ratio = float(last["VOLATILITY_RATIO"]) if "VOLATILITY_RATIO" in df.columns else 1.0
-    current_trend_strength = float(last["TREND_STRENGTH"]) if "TREND_STRENGTH" in df.columns else 1.0
+    market_regime = detect_market_regime(signal_df)
+    confirm_bias, trend_bias = get_multi_timeframe_bias(symbol, timeframe)
+    candle_buy_bonus, candle_sell_bonus = get_candle_confirmation_bonus(signal_df)
+    level_buy_bonus, level_sell_bonus = get_level_proximity_bonus(signal_df)
+
+    current_volatility_ratio = float(last["VOLATILITY_RATIO"]) if "VOLATILITY_RATIO" in signal_df.columns else 1.0
+    current_trend_strength = float(last["TREND_STRENGTH"]) if "TREND_STRENGTH" in signal_df.columns else 1.0
 
     strategy_results = [
-        strategy_ema_pullback(df),
-        strategy_rsi_reversal(df),
-        strategy_bollinger_reversal(df),
-        strategy_macd_momentum(df),
-        strategy_breakout(df),
-        strategy_heikin_ashi(df),
-        strategy_support_resistance(df),
+        strategy_ema_pullback(signal_df),
+        strategy_rsi_reversal(signal_df),
+        strategy_bollinger_reversal(signal_df),
+        strategy_macd_momentum(signal_df),
+        strategy_breakout(signal_df),
+        strategy_heikin_ashi(signal_df),
+        strategy_support_resistance(signal_df),
     ]
 
     for item in strategy_results:
@@ -929,13 +1017,32 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
     signal, confidence, quality_score, strategy_name, reason = combine_strategy_results(
         strategy_results,
         market_regime,
-        higher_timeframe_bias,
+        confirm_bias,
+        trend_bias,
         candle_buy_bonus,
         candle_sell_bonus,
         level_buy_bonus,
         level_sell_bonus,
     )
 
+    MIN_CONFIDENCE = 35.0
+    MIN_QUALITY = 28.0
+
+    if signal != "NONE":
+        if confidence < MIN_CONFIDENCE or quality_score < MIN_QUALITY:
+            signal = "NONE"
+            strategy_name = "Нет сигнала"
+            reason = f"Сигнал слишком слабый: confidence={confidence}, quality={quality_score}"
+
+    if signal != "NONE":
+        if confirm_bias != "NONE" and trend_bias != "NONE" and confirm_bias != trend_bias:
+            if confidence < 45:
+                signal = "NONE"
+                strategy_name = "Нет сигнала"
+                reason = (
+                    f"Конфликт таймфреймов: confirm={confirm_bias}, trend={trend_bias}, "
+                    f"confidence={confidence}"
+                )
     if signal == "NONE":
         entry_price = None
         tp = None
@@ -984,23 +1091,24 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
         "symbol": symbol,
         "timeframe": timeframe,
         "duration_type": duration_type,
-        "price": price,
-        "entry_price": entry_price,
+        "price": round(price, 5),
+        "entry_price": round(float(entry_price), 5) if entry_price is not None else None,
         "signal": signal,
         "confidence": confidence,
-	"signal_quality": quality_score,
+        "signal_quality": quality_score,
         "rsi": round(rsi, 2),
         "tp": round(float(tp), 5) if tp is not None else None,
         "sl": round(float(sl), 5) if sl is not None else None,
         "market_regime": market_regime,
-        "higher_timeframe_bias": higher_timeframe_bias,
+        "confirm_bias": confirm_bias,
+        "trend_bias": trend_bias,
         "strategy": strategy_name,
-	"candle_buy_bonus": candle_buy_bonus,
-	"candle_sell_bonus": candle_sell_bonus,
-	"level_buy_bonus": level_buy_bonus,
-	"level_sell_bonus": level_sell_bonus,
-	"trend_strength": current_trend_strength,
-	"volatility_ratio": current_volatility_ratio,
+        "candle_buy_bonus": candle_buy_bonus,
+        "candle_sell_bonus": candle_sell_bonus,
+        "level_buy_bonus": level_buy_bonus,
+        "level_sell_bonus": level_sell_bonus,
+        "trend_strength": round(current_trend_strength, 3),
+        "volatility_ratio": round(current_volatility_ratio, 3),
         "recommended_expiry": recommended_expiry,
         "chart_prices": chart_prices,
         "chart_labels": chart_labels,

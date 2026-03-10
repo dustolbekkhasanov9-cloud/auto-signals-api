@@ -1,0 +1,387 @@
+Last login: Mon Mar  9 00:01:03 on ttys004
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3
+Python 3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+>>> from signal_engine import analyze_symbol
+>>> result = analyze_symbol("EURUSD=X", timeframe="15m", duration_type="short")
+>>> print(result["signal"])
+BUY
+>>> print(result["confidence"])
+24.3
+>>> print(result["higher_timeframe_bias"])
+BUY
+>>> print(result["reason"])
+Три подряд бычьих Heikin Ashi свечи; Краткосрочный тренд вверх подтверждён; Старший ТФ подтверждает BUY
+>>> exit()
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+Sorry: IndentationError: expected an indented block after 'if' statement on line 684 (signal_engine.py, line 685)%                                                                                                      director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+Sorry: IndentationError: unexpected indent (signal_engine.py, line 676)%                                    director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+Sorry: IndentationError: expected an indented block after 'if' statement on line 684 (signal_engine.py, line 685)%                                                                                                      director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3
+Python 3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+>>> from signal_engine import analyze_symbol
+>>> 
+>>> result = analyze_symbol("EURUSD=X", timeframe="15m", duration_type="short")
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "/Users/director_113mvideo.ru/Kiki/Облако/signal_engine.py", line 820, in analyze_symbol
+    signal, confidence, strategy_name, reason = combine_strategy_results(
+                                                ^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: combine_strategy_results() takes from 2 to 3 positional arguments but 5 were given
+>>> print(result["signal"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'result' is not defined
+>>> print(result["confidence"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'result' is not defined
+>>> print(result["higher_timeframe_bias"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'result' is not defined
+>>> print(result["strategy"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'result' is not defined
+>>> print(result["reason"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'result' is not defined
+>>> exit()
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3
+Python 3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+>>> from signal_engine import analyze_symbol
+>>> result = analyze_symbol("EURUSD=X", timeframe="15m", duration_type="short")
+print(result["signal"])
+print(result["confidence"])
+print(result["higher_timeframe_bias"])
+print(result["strategy"])
+print(result["reason"])
+>>> print(result["signal"])
+BUY
+>>> print(result["confidence"])
+24.3
+>>> print(result["higher_timeframe_bias"])
+BUY
+>>> print(result["strategy"])
+Heikin Ashi Trend
+>>> print(result["reason"])
+Три подряд бычьих Heikin Ashi свечи; Краткосрочный тренд вверх подтверждён; Старший ТФ подтверждает BUY
+>>> exit()
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3
+Python 3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+>>> from signal_engine import analyze_symbol
+>>> 
+>>> for tf in ["5m", "15m", "1h"]:
+...     result = analyze_symbol("EURUSD=X", timeframe=tf, duration_type="short")
+...     print(tf, result["signal"], result["confidence"], result["higher_timeframe_bias"], result["strategy"])
+... 
+KeyboardInterrupt
+>>> result = analyze_symbol("EURUSD=X", timeframe="5m", duration_type="short")
+print("5m", result["signal"], result["confidence"], result["higher_timeframe_bias"], result["strategy"])
+
+result = analyze_symbol("EURUSD=X", timeframe="15m", duration_type="short")
+print("15m", result["signal"], result["confidence"], result["higher_timeframe_bias"], result["strategy"])
+
+result = analyze_symbol("EURUSD=X", timeframe="1h", duration_type="short")
+print("1h", result["signal"], result["confidence"], result["higher_timeframe_bias"], result["strategy"])
+>>> print("5m", result["signal"], result["confidence"], result["higher_timeframe_bias"], result["strategy"]) 
+5m BUY 27.0 BUY Heikin Ashi Trend
+>>> 
+>>> result = analyze_symbol("EURUSD=X", timeframe="15m", duration_type="short")
+>>> print("15m", result["signal"], result["confidence"], result["higher_timeframe_bias"], result["strategy"])
+15m BUY 24.3 BUY Heikin Ashi Trend
+>>> 
+>>> result = analyze_symbol("EURUSD=X", timeframe="1h", duration_type="short")
+>>> print("1h", result["signal"], result["confidence"], result["higher_timeframe_bias"], result["strategy"]) 
+1h SELL 31.2 SELL Resistance Bounce
+>>>  exit()
+  File "<stdin>", line 1
+    exit()
+IndentationError: unexpected indent
+>>> exit()
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3
+Python 3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+>>> from signal_engine import analyze_symbol
+>>> 
+>>> result = analyze_symbol("EURUSD=X", timeframe="1h", duration_type="short")
+print(result["signal"])
+print(result["confidence"])
+print(result["higher_timeframe_bias"])
+print(result["strategy"])
+print(result["reason"])
+>>> print(result["signal"])
+SELL
+>>> print(result["confidence"])
+36.6
+>>> print(result["higher_timeframe_bias"])
+SELL
+>>> print(result["strategy"])
+Resistance Bounce
+>>> print(result["reason"])
+Цена тестирует сопротивление; Есть отбой вниз от уровня; Старший ТФ подтверждает SELL
+>>> exit()
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % cd ~/Kiki/Облако
+git add .
+git commit -m "improve signal engine accuracy"
+git push
+[main 00d2dab] improve signal engine accuracy
+ Committer: Dustolbek <director_113mvideo.ru@MacBook-Air-Dustolbek.local>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 2 files changed, 305 insertions(+), 11 deletions(-)
+ create mode 100644 __pycache__/signal_engine.cpython-311.pyc
+Enumerating objects: 7, done.
+Counting objects: 100% (7/7), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (5/5), done.
+Writing objects: 100% (5/5), 21.25 KiB | 10.63 MiB/s, done.
+Total 5 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To https://github.com/dustolbekkhasanov9-cloud/auto-signals-api.git
+   d2883b4..00d2dab  main -> main
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3
+Python 3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+>>> from signal_engine import analyze_symbol
+>>> 
+>>> r = analyze_symbol("EURUSD=X", timeframe="15m", duration_type="short")
+print(r["signal"])
+print(r["confidence"])
+print(r["signal_quality"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+  File "/Users/director_113mvideo.ru/Kiki/Облако/signal_engine.py", line 990, in analyze_symbol
+    "signal_quality": quality_score,
+                      ^^^^^^^^^^^^^
+NameError: name 'quality_score' is not defined
+>>> print(r["signal"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'r' is not defined
+>>> print(r["confidence"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'r' is not defined
+>>> print(r["signal_quality"])
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+NameError: name 'r' is not defined
+>>>  exit()
+  File "<stdin>", line 1
+    exit()
+IndentationError: unexpected indent
+>>> exit()
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % cd ~/Kiki/Облако
+python3 -m py_compile signal_engine.py
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % python3
+Python 3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+>>> from signal_engine import analyze_symbol
+>>> 
+>>> r = analyze_symbol("EURUSD=X", timeframe="15m", duration_type="short")
+print(r["signal"])
+print(r["confidence"])
+print(r["signal_quality"])
+>>> print(r["signal"])
+BUY
+>>> print(r["confidence"])
+30.8
+>>> print(r["signal_quality"])
+50.0
+>>> exit()
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % cd ~/Kiki/Облако
+git add .
+git commit -m "upgrade signal engine with quality score"
+git push
+[main 4e62a85] upgrade signal engine with quality score
+ Committer: Dustolbek <director_113mvideo.ru@MacBook-Air-Dustolbek.local>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 4 files changed, 21 insertions(+), 9 deletions(-)
+Enumerating objects: 15, done.
+Counting objects: 100% (15/15), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (8/8), done.
+Writing objects: 100% (8/8), 5.74 KiB | 5.74 MiB/s, done.
+Total 8 (delta 6), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (6/6), completed with 6 local objects.
+To https://github.com/dustolbekkhasanov9-cloud/auto-signals-api.git
+   00d2dab..4e62a85  main -> main
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % cd ~/Kiki/Облако
+git add .
+git commit -m "upgrade signal engine with quality score"
+git push
+[main 5f313fa] upgrade signal engine with quality score
+ Committer: Dustolbek <director_113mvideo.ru@MacBook-Air-Dustolbek.local>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 1 file changed, 82 insertions(+), 2 deletions(-)
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 710 bytes | 710.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To https://github.com/dustolbekkhasanov9-cloud/auto-signals-api.git
+   fc2762e..5f313fa  main -> main
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % cd ~/Kiki/Облако
+git add .
+git commit -m "upgrade signal engine with quality score"
+git push
+
+[main 7374174] upgrade signal engine with quality score
+ Committer: Dustolbek <director_113mvideo.ru@MacBook-Air-Dustolbek.local>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 437 bytes | 437.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To https://github.com/dustolbekkhasanov9-cloud/auto-signals-api.git
+   5f313fa..7374174  main -> main
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % cd ~/Kiki/Облако
+git add .
+git commit -m "save full active signal snapshot with chart data"
+git push
+[main 58c03f7] save full active signal snapshot with chart data
+ Committer: Dustolbek <director_113mvideo.ru@MacBook-Air-Dustolbek.local>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 1 file changed, 36 insertions(+), 12 deletions(-)
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 734 bytes | 734.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To https://github.com/dustolbekkhasanov9-cloud/auto-signals-api.git
+   7374174..58c03f7  main -> main
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % git add .
+git commit -m "fix history flow for closed signals only"
+git push
+[main 1f1b316] fix history flow for closed signals only
+ Committer: Dustolbek <director_113mvideo.ru@MacBook-Air-Dustolbek.local>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 1 file changed, 1 deletion(-)
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 332 bytes | 332.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To https://github.com/dustolbekkhasanov9-cloud/auto-signals-api.git
+   58c03f7..1f1b316  main -> main
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % git add .
+git commit -m "fix history flow for closed signals only"
+git push
+
+On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+Everything up-to-date
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % git add .
+git commit -m "fix history flow for closed signals only"
+git push
+[main bc73339] fix history flow for closed signals only
+ Committer: Dustolbek <director_113mvideo.ru@MacBook-Air-Dustolbek.local>
+Your name and email address were configured automatically based
+on your username and hostname. Please check that they are accurate.
+You can suppress this message by setting them explicitly:
+
+    git config --global user.name "Your Name"
+    git config --global user.email you@example.com
+
+After doing this, you may fix the identity used for this commit with:
+
+    git commit --amend --reset-author
+
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 402 bytes | 402.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To https://github.com/dustolbekkhasanov9-cloud/auto-signals-api.git
+   1f1b316..bc73339  main -> main
+director_113mvideo.ru@MacBook-Air-Dustolbek Облако % 
