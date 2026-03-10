@@ -294,6 +294,12 @@ git add .
 git commit -m "improve signal engine accuracy"
 git push
 
+или
+cd ~/Kiki/Облако
+git add .
+git commit -m "update"
+git push
+
 
 # Инструкция для нового чата с ChatGPT
 

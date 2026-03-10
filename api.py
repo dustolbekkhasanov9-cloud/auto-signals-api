@@ -26,6 +26,9 @@ DEFAULT_DURATION_TYPE = "short"
 
 REFRESH_SECONDS = 30
 
+SCAN_TIMEFRAMES = ["5m", "10m", "30m", "1h"]
+SCAN_DURATION_TYPES = ["short", "long"]
+
 signal_cache: Dict[str, Dict[str, Any]] = {}
 last_updated_at: str | None = None
 last_refresh_status: str = "starting"
@@ -50,26 +53,33 @@ def make_error_payload(symbol: str, reason: str) -> dict:
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
+    MIN_ACTIVE_CONFIDENCE = 30.0
+
     for item in items:
         if not isinstance(item, dict):
             continue
 
         signal = item.get("signal", "NONE")
+        confidence = float(item.get("confidence", 0.0) or 0.0)
         symbol = item.get("symbol", "")
         timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
         duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
-        entry_time_iso = item.get("entry_time_iso", "")
+        entry_time_iso = item.get("entry_time_iso", "")[:16]
         strategy = item.get("strategy", "")
 
         if signal not in ("BUY", "SELL"):
             continue
 
-        signal_id = f"{symbol}_{signal}_{timeframe}_{entry_time_iso}"
+        if confidence < MIN_ACTIVE_CONFIDENCE:
+            continue
+
+        signal_id = f"{symbol}_{signal}_{timeframe}_{duration_type}_{entry_time_iso}"
 
         active_item = {
+            "id": signal_id,
             "symbol": symbol,
             "signal": signal,
-            "confidence": item.get("confidence", 0.0),
+            "confidence": confidence,
             "signal_quality": item.get("signal_quality", 0.0),
             "price": item.get("price"),
             "entry_price": item.get("entry_price"),
@@ -117,7 +127,7 @@ def add_signals_to_history(items: list[dict]) -> None:
         symbol = item.get("symbol", "")
         timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
         duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
-        entry_time_iso = item.get("entry_time_iso", "")
+        entry_time_iso = item.get("entry_time_iso", "")[:16]
         strategy = item.get("strategy", "")
 
         if signal == "NONE":
@@ -243,13 +253,13 @@ def update_closed_history_results() -> None:
     active_signals = still_active
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
-async def analyze_symbol_safe(symbol: str) -> dict:
+async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
     try:
         result = await asyncio.to_thread(
             analyze_symbol,
             symbol,
-            DEFAULT_TIMEFRAME,
-            DEFAULT_DURATION_TYPE,
+            timeframe,
+            duration_type,
         )
 
         if not isinstance(result, dict):
@@ -258,42 +268,68 @@ async def analyze_symbol_safe(symbol: str) -> dict:
         return result
 
     except Exception as e:
-        logger.exception("Ошибка анализа %s: %s", symbol, e)
+        logger.exception(
+            "Ошибка анализа %s %s %s: %s",
+            symbol,
+            timeframe,
+            duration_type,
+            e,
+        )
         return make_error_payload(symbol, f"Ошибка анализа: {str(e)}")
 
 
 async def refresh_all_signals() -> None:
     global signal_cache, last_updated_at, last_refresh_status
 
-    logger.info("Обновление сигналов началось")
+    logger.info("Фоновое обновление сигналов началось")
 
-    tasks = [analyze_symbol_safe(symbol) for symbol in DEFAULT_SYMBOLS]
+    tasks = []
+    task_keys = []
+
+    for symbol in DEFAULT_SYMBOLS:
+        for timeframe in SCAN_TIMEFRAMES:
+            for duration_type in SCAN_DURATION_TYPES:
+                tasks.append(analyze_symbol_safe(symbol, timeframe, duration_type))
+                task_keys.append((symbol, timeframe, duration_type))
+
     results = await asyncio.gather(*tasks)
 
     new_cache: Dict[str, Dict[str, Any]] = {}
+    all_results: list[dict] = []
 
-    for item in results:
-        symbol = item.get("symbol")
-        if symbol:
-            new_cache[symbol] = item
+    for i, item in enumerate(results):
+        symbol, timeframe, duration_type = task_keys[i]
 
-        if new_cache:
-            signal_cache = new_cache
-            last_updated_at = now_iso()
-            last_refresh_status = "ok"
+        if not isinstance(item, dict):
+            continue
 
-            # сохраняем найденные сигналы
-            add_signals_to_active(results)
+        item["timeframe"] = item.get("timeframe", timeframe)
+        item["duration_type"] = item.get("duration_type", duration_type)
 
-            # сохраняем их снимок в историю
+        all_results.append(item)
 
-            # проверяем какие сигналы уже закрылись
-            update_closed_history_results()
+        if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
+            item_symbol = item.get("symbol")
+            if item_symbol:
+                new_cache[item_symbol] = item
 
-            logger.info("Сигналы обновлены: %s", len(signal_cache))
-        else:
-            last_refresh_status = "error"
-            logger.warning("Обновление сигналов не дало результатов")
+    if new_cache:
+        signal_cache = new_cache
+        last_updated_at = now_iso()
+        last_refresh_status = "ok"
+
+        add_signals_to_active(all_results)
+        update_closed_history_results()
+
+        logger.info(
+            "Сигналы обновлены: cache=%s, scanned=%s, active=%s",
+            len(signal_cache),
+            len(all_results),
+            len(active_signals),
+        )
+    else:
+        last_refresh_status = "error"
+        logger.warning("Фоновое обновление не дало результатов")
 
 
 async def background_refresh_loop() -> None:
@@ -361,16 +397,12 @@ def get_signal(
     timeframe: str = Query(default=DEFAULT_TIMEFRAME),
     duration_type: str = Query(default=DEFAULT_DURATION_TYPE),
 ):
-
-    # если пользователь запрашивает нестандартный символ
     if symbol not in DEFAULT_SYMBOLS:
         return analyze_symbol(symbol, timeframe, duration_type)
 
-    # если стандартный — берем из кэша
     if symbol in signal_cache:
         cached = signal_cache[symbol].copy()
 
-        # если пользователь указал другой таймфрейм — пересчитываем
         if timeframe != DEFAULT_TIMEFRAME or duration_type != DEFAULT_DURATION_TYPE:
             return analyze_symbol(symbol, timeframe, duration_type)
 
@@ -418,6 +450,8 @@ def get_signals(
 
 @app.get("/active_signals")
 def get_active_signals(limit: int = 50):
+    update_closed_history_results()
+
     open_items = [
         item for item in active_signals
         if item.get("result") == "OPEN"
