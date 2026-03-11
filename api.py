@@ -109,7 +109,6 @@ def add_signals_to_active(items: list[dict]) -> None:
         except Exception:
             continue
 
-        # если сигнал уже истёк — не добавляем в active_signals
         if exit_dt <= now_utc:
             continue
 
@@ -151,9 +150,7 @@ def add_signals_to_active(items: list[dict]) -> None:
 
         new_active.append(active_item)
 
-    # полностью заменяем список активных сигналов только свежими
     active_signals = new_active
-
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
 
