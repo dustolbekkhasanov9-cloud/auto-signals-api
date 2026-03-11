@@ -77,6 +77,8 @@ def history_duplicate_exists(item: dict) -> bool:
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
+    active_signals.clear()
+
     MIN_ACTIVE_CONFIDENCE = 30.0
 
     for item in items:
