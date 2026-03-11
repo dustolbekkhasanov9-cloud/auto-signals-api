@@ -30,6 +30,7 @@ SCAN_TIMEFRAMES = ["5m", "10m", "30m", "1h"]
 SCAN_DURATION_TYPES = ["short", "long"]
 
 signal_cache: Dict[str, Dict[str, Any]] = {}
+scan_cache: Dict[str, Dict[str, Any]] = {}
 last_updated_at: str | None = None
 last_refresh_status: str = "starting"
 
@@ -43,6 +44,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def make_cache_key(symbol: str, timeframe: str, duration_type: str) -> str:
+    return f"{symbol}|{timeframe}|{duration_type}"
+
+
 def make_error_payload(symbol: str, reason: str) -> dict:
     return {
         "symbol": symbol,
@@ -50,6 +55,8 @@ def make_error_payload(symbol: str, reason: str) -> dict:
         "confidence": 0.0,
         "reason": reason,
     }
+
+
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
@@ -116,6 +123,8 @@ def add_signals_to_active(items: list[dict]) -> None:
 
         if not duplicate_exists:
             active_signals.insert(0, active_item)
+
+
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
 
@@ -180,6 +189,8 @@ def add_signals_to_history(items: list[dict]) -> None:
             signal_history.insert(0, history_item)
 
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
+
+
 def update_closed_history_results() -> None:
     global active_signals, signal_history
 
@@ -217,9 +228,14 @@ def update_closed_history_results() -> None:
             signal_history.insert(0, item)
             continue
 
-        try:
-            latest = analyze_symbol(symbol, timeframe, duration_type)
-        except Exception:
+        cache_key = make_cache_key(symbol, timeframe, duration_type)
+        latest = scan_cache.get(cache_key)
+
+        if not latest:
+            default_key = make_cache_key(symbol, DEFAULT_TIMEFRAME, DEFAULT_DURATION_TYPE)
+            latest = scan_cache.get(default_key) or signal_cache.get(symbol)
+
+        if not latest:
             item["result"] = "CLOSED"
             signal_history.insert(0, item)
             continue
@@ -253,6 +269,7 @@ def update_closed_history_results() -> None:
     active_signals = still_active
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
+
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
     try:
         result = await asyncio.to_thread(
@@ -279,7 +296,7 @@ async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -
 
 
 async def refresh_all_signals() -> None:
-    global signal_cache, last_updated_at, last_refresh_status
+    global signal_cache, scan_cache, last_updated_at, last_refresh_status
 
     logger.info("Фоновое обновление сигналов началось")
 
@@ -295,6 +312,7 @@ async def refresh_all_signals() -> None:
     results = await asyncio.gather(*tasks)
 
     new_cache: Dict[str, Dict[str, Any]] = {}
+    new_scan_cache: Dict[str, Dict[str, Any]] = {}
     all_results: list[dict] = []
 
     for i, item in enumerate(results):
@@ -303,10 +321,14 @@ async def refresh_all_signals() -> None:
         if not isinstance(item, dict):
             continue
 
+        item["symbol"] = item.get("symbol", symbol)
         item["timeframe"] = item.get("timeframe", timeframe)
         item["duration_type"] = item.get("duration_type", duration_type)
 
         all_results.append(item)
+
+        cache_key = make_cache_key(symbol, timeframe, duration_type)
+        new_scan_cache[cache_key] = item
 
         if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
             item_symbol = item.get("symbol")
@@ -315,6 +337,7 @@ async def refresh_all_signals() -> None:
 
     if new_cache:
         signal_cache = new_cache
+        scan_cache = new_scan_cache
         last_updated_at = now_iso()
         last_refresh_status = "ok"
 
@@ -322,8 +345,9 @@ async def refresh_all_signals() -> None:
         update_closed_history_results()
 
         logger.info(
-            "Сигналы обновлены: cache=%s, scanned=%s, active=%s",
+            "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s",
             len(signal_cache),
+            len(scan_cache),
             len(all_results),
             len(active_signals),
         )
@@ -375,6 +399,7 @@ def root():
         "status": "ok",
         "symbols_count": len(DEFAULT_SYMBOLS),
         "cache_size": len(signal_cache),
+        "scan_cache_size": len(scan_cache),
         "refresh_seconds": REFRESH_SECONDS,
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
@@ -386,6 +411,7 @@ def health():
     return {
         "status": "ok",
         "cache_ready": len(signal_cache) > 0,
+        "scan_cache_ready": len(scan_cache) > 0,
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
     }
@@ -398,15 +424,16 @@ def get_signal(
     duration_type: str = Query(default=DEFAULT_DURATION_TYPE),
 ):
     if symbol not in DEFAULT_SYMBOLS:
-        return analyze_symbol(symbol, timeframe, duration_type)
+        raise HTTPException(
+            status_code=404,
+            detail="Символ не поддерживается",
+        )
 
-    if symbol in signal_cache:
-        cached = signal_cache[symbol].copy()
+    cache_key = make_cache_key(symbol, timeframe, duration_type)
+    cached = scan_cache.get(cache_key)
 
-        if timeframe != DEFAULT_TIMEFRAME or duration_type != DEFAULT_DURATION_TYPE:
-            return analyze_symbol(symbol, timeframe, duration_type)
-
-        return cached
+    if cached:
+        return cached.copy()
 
     raise HTTPException(
         status_code=503,
@@ -419,34 +446,27 @@ def get_signals(
     timeframe: str = Query(default=DEFAULT_TIMEFRAME),
     duration_type: str = Query(default=DEFAULT_DURATION_TYPE),
 ):
+    items = []
 
-    if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
-        items = [signal_cache[s] for s in DEFAULT_SYMBOLS if s in signal_cache]
+    for symbol in DEFAULT_SYMBOLS:
+        cache_key = make_cache_key(symbol, timeframe, duration_type)
+        item = scan_cache.get(cache_key)
 
-        return {
-            "items": items,
-            "meta": {
-                "last_updated_at": last_updated_at,
-                "last_refresh_status": last_refresh_status,
-                "refresh_seconds": REFRESH_SECONDS,
-                "count": len(items),
-            },
-        }
-
-    # если пользователь выбрал другой таймфрейм — считаем на лету
-    items = [
-        analyze_symbol(symbol, timeframe, duration_type)
-        for symbol in DEFAULT_SYMBOLS
-    ]
+        if item:
+            items.append(item)
 
     return {
         "items": items,
         "meta": {
             "timeframe": timeframe,
             "duration_type": duration_type,
+            "last_updated_at": last_updated_at,
+            "last_refresh_status": last_refresh_status,
+            "refresh_seconds": REFRESH_SECONDS,
             "count": len(items),
         },
     }
+
 
 @app.get("/active_signals")
 def get_active_signals(limit: int = 50):
@@ -459,7 +479,6 @@ def get_active_signals(limit: int = 50):
     valid_items = []
 
     for item in active_signals:
-
         if item.get("result") != "OPEN":
             continue
 
@@ -473,7 +492,6 @@ def get_active_signals(limit: int = 50):
         except Exception:
             continue
 
-        # если сигнал уже истёк — не показываем
         if exit_dt <= now_utc:
             continue
 
@@ -488,6 +506,7 @@ def get_active_signals(limit: int = 50):
         "last_updated_at": last_updated_at,
     }
 
+
 @app.post("/refresh")
 async def manual_refresh():
     await refresh_all_signals()
@@ -498,6 +517,7 @@ async def manual_refresh():
         "last_updated_at": last_updated_at,
         "count": len(signal_cache),
     }
+
 
 @app.get("/history")
 def get_history(limit: int = 50):
