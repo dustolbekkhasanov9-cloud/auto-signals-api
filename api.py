@@ -450,16 +450,40 @@ def get_signals(
 
 @app.get("/active_signals")
 def get_active_signals(limit: int = 50):
+    global active_signals
+
     update_closed_history_results()
 
-    open_items = [
-        item for item in active_signals
-        if item.get("result") == "OPEN"
-    ]
+    now_utc = datetime.now(timezone.utc)
+
+    valid_items = []
+
+    for item in active_signals:
+
+        if item.get("result") != "OPEN":
+            continue
+
+        exit_time_iso = item.get("exit_time_iso")
+
+        if not exit_time_iso:
+            continue
+
+        try:
+            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        # если сигнал уже истёк — не показываем
+        if exit_dt <= now_utc:
+            continue
+
+        valid_items.append(item)
+
+    active_signals = valid_items
 
     return {
-        "items": open_items[:limit],
-        "count": len(open_items),
+        "items": valid_items[:limit],
+        "count": len(valid_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
     }
