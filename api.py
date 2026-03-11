@@ -508,15 +508,13 @@ def get_active_signals(limit: int = 50):
     update_closed_history_results()
 
     now_utc = datetime.now(timezone.utc)
-
-    valid_items = []
+    fresh_items: list[dict] = []
 
     for item in active_signals:
         if item.get("result") != "OPEN":
             continue
 
         exit_time_iso = item.get("exit_time_iso")
-
         if not exit_time_iso:
             continue
 
@@ -528,15 +526,16 @@ def get_active_signals(limit: int = 50):
         if exit_dt <= now_utc:
             continue
 
-        valid_items.append(item)
+        fresh_items.append(item)
 
-    active_signals = valid_items
+    active_signals = fresh_items
 
     return {
-        "items": valid_items[:limit],
-        "count": len(valid_items),
+        "items": fresh_items[:limit],
+        "count": len(fresh_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
+        "server_now_utc": now_utc.isoformat(),
     }
 
 
