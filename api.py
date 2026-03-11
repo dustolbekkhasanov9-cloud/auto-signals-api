@@ -26,7 +26,7 @@ DEFAULT_DURATION_TYPE = "short"
 
 REFRESH_SECONDS = 30
 
-SCAN_TIMEFRAMES = ["5m", "10m", "30m", "1h"]
+SCAN_TIMEFRAMES = ["5m", "10m", "15m", "30m", "1h"]
 SCAN_DURATION_TYPES = ["short", "long"]
 
 signal_cache: Dict[str, Dict[str, Any]] = {}
