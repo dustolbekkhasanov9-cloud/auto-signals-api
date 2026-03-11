@@ -77,9 +77,10 @@ def history_duplicate_exists(item: dict) -> bool:
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
-    active_signals.clear()
-
     MIN_ACTIVE_CONFIDENCE = 30.0
+    now_utc = datetime.now(timezone.utc)
+
+    new_active: list[dict] = []
 
     for item in items:
         if not isinstance(item, dict):
@@ -92,11 +93,24 @@ def add_signals_to_active(items: list[dict]) -> None:
         duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
         entry_time_iso = item.get("entry_time_iso", "")[:16]
         strategy = item.get("strategy", "")
+        exit_time_iso = item.get("exit_time_iso", "")
 
         if signal not in ("BUY", "SELL"):
             continue
 
         if confidence < MIN_ACTIVE_CONFIDENCE:
+            continue
+
+        if not exit_time_iso:
+            continue
+
+        try:
+            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
+        except Exception:
+            continue
+
+        # если сигнал уже истёк — не добавляем в active_signals
+        if exit_dt <= now_utc:
             continue
 
         signal_id = f"{symbol}_{signal}_{timeframe}_{duration_type}_{entry_time_iso}"
@@ -121,7 +135,7 @@ def add_signals_to_active(items: list[dict]) -> None:
             "entry_time": item.get("entry_time", ""),
             "exit_time": item.get("exit_time", ""),
             "entry_time_iso": entry_time_iso,
-            "exit_time_iso": item.get("exit_time_iso", ""),
+            "exit_time_iso": exit_time_iso,
             "reason": item.get("reason", ""),
             "chart_prices": item.get("chart_prices", []),
             "chart_labels": item.get("chart_labels", []),
@@ -135,16 +149,10 @@ def add_signals_to_active(items: list[dict]) -> None:
             "saved_at": now_iso(),
         }
 
-        active_signals = [
-            a for a in active_signals
-            if not (
-                a.get("symbol") == symbol
-                and a.get("timeframe") == timeframe
-                and a.get("duration_type") == duration_type
-            )
-        ]
+        new_active.append(active_item)
 
-        active_signals.insert(0, active_item)
+    # полностью заменяем список активных сигналов только свежими
+    active_signals = new_active
 
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
