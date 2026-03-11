@@ -133,14 +133,16 @@ def add_signals_to_active(items: list[dict]) -> None:
             "saved_at": now_iso(),
         }
 
-        duplicate_exists = any(
-            a.get("id") == signal_id
-            for a in active_signals
-        )
+        active_signals = [
+            a for a in active_signals
+            if not (
+                a.get("symbol") == symbol
+                and a.get("timeframe") == timeframe
+                and a.get("duration_type") == duration_type
+            )
+        ]
 
-        if not duplicate_exists:
-            active_signals.insert(0, active_item)
-
+        active_signals.insert(0, active_item)
 
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
