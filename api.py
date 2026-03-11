@@ -26,7 +26,7 @@ DEFAULT_DURATION_TYPE = "short"
 
 REFRESH_SECONDS = 30
 
-SCAN_TIMEFRAMES = ["5m", "10m", "15m", "30m", "1h"]
+SCAN_TIMEFRAMES = ["5m", "10m", "30m", "1h"]
 SCAN_DURATION_TYPES = ["short", "long"]
 
 signal_cache: Dict[str, Dict[str, Any]] = {}
@@ -55,6 +55,23 @@ def make_error_payload(symbol: str, reason: str) -> dict:
         "confidence": 0.0,
         "reason": reason,
     }
+
+
+def history_duplicate_exists(item: dict) -> bool:
+    symbol = item.get("symbol")
+    signal = item.get("signal")
+    timeframe = item.get("timeframe")
+    duration_type = item.get("duration_type")
+    entry_time_iso = item.get("entry_time_iso")
+
+    return any(
+        h.get("symbol") == symbol
+        and h.get("signal") == signal
+        and h.get("timeframe") == timeframe
+        and h.get("duration_type") == duration_type
+        and h.get("entry_time_iso") == entry_time_iso
+        for h in signal_history
+    )
 
 
 def add_signals_to_active(items: list[dict]) -> None:
@@ -205,14 +222,16 @@ def update_closed_history_results() -> None:
         exit_time_iso = item.get("exit_time_iso", "")
         if not exit_time_iso:
             item["result"] = "CLOSED"
-            signal_history.insert(0, item)
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         try:
             exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
         except Exception:
             item["result"] = "CLOSED"
-            signal_history.insert(0, item)
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         if exit_dt > now_utc:
@@ -225,7 +244,8 @@ def update_closed_history_results() -> None:
 
         if not symbol:
             item["result"] = "CLOSED"
-            signal_history.insert(0, item)
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         cache_key = make_cache_key(symbol, timeframe, duration_type)
@@ -237,7 +257,8 @@ def update_closed_history_results() -> None:
 
         if not latest:
             item["result"] = "CLOSED"
-            signal_history.insert(0, item)
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         current_price = latest.get("price")
@@ -246,7 +267,8 @@ def update_closed_history_results() -> None:
 
         if current_price is None or entry_price is None or signal not in ("BUY", "SELL"):
             item["result"] = "CLOSED"
-            signal_history.insert(0, item)
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         try:
@@ -254,7 +276,8 @@ def update_closed_history_results() -> None:
             entry_price = float(entry_price)
         except Exception:
             item["result"] = "CLOSED"
-            signal_history.insert(0, item)
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         if signal == "BUY":
@@ -264,7 +287,8 @@ def update_closed_history_results() -> None:
         else:
             item["result"] = "CLOSED"
 
-        signal_history.insert(0, item)
+        if not history_duplicate_exists(item):
+            signal_history.insert(0, item)
 
     active_signals = still_active
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
