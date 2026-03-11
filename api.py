@@ -91,7 +91,7 @@ def add_signals_to_active(items: list[dict]) -> None:
         symbol = item.get("symbol", "")
         timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
         duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
-        entry_time_iso = item.get("entry_time_iso", "")[:16]
+        entry_time_iso = item.get("entry_time_iso", "")
         strategy = item.get("strategy", "")
         exit_time_iso = item.get("exit_time_iso", "")
 
@@ -162,7 +162,7 @@ def add_signals_to_history(items: list[dict]) -> None:
         symbol = item.get("symbol", "")
         timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
         duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
-        entry_time_iso = item.get("entry_time_iso", "")[:16]
+        entry_time_iso = item.get("entry_time_iso", "")
         strategy = item.get("strategy", "")
 
         if signal == "NONE":
@@ -523,11 +523,13 @@ def get_active_signals(limit: int = 50):
         except Exception:
             continue
 
+        # сигнал уже закончился
         if exit_dt <= now_utc:
             continue
 
         fresh_items.append(item)
 
+    # очищаем список от старых сигналов
     active_signals = fresh_items
 
     return {
@@ -535,7 +537,7 @@ def get_active_signals(limit: int = 50):
         "count": len(fresh_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
-        "server_now_utc": now_utc.isoformat(),
+        "server_now_utc": now_utc.isoformat()
     }
 
 
