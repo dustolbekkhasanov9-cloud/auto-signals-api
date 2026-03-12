@@ -1,3 +1,4 @@
+from news_feed import build_feed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import asyncio
@@ -534,3 +535,6 @@ def get_history(limit: int = 50):
         "limit": limit,
         "last_updated_at": last_updated_at,
     }
+@app.get("/feed")
+def get_feed():
+    return build_feed()
