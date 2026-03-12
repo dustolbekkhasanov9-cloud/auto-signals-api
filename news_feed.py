@@ -1,7 +1,7 @@
 import requests
 from datetime import datetime, timezone
 
-NEWS_API_KEY = "PASTE_YOUR_KEY_HERE"
+NEWS_API_KEY = "21086f3e99744e89aa2ebca1c367e786"
 
 
 def fetch_top_news():
