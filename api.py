@@ -77,80 +77,48 @@ def history_duplicate_exists(item: dict) -> bool:
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
-    MIN_ACTIVE_CONFIDENCE = 30.0
-    now_utc = datetime.now(timezone.utc)
-
-    new_active: list[dict] = []
+    existing_keys = {
+        (
+            s.get("symbol"),
+            s.get("signal"),
+            s.get("timeframe"),
+            s.get("duration_type"),
+            s.get("entry_time_iso"),
+        )
+        for s in active_signals
+    }
 
     for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        signal = item.get("signal", "NONE")
-        confidence = float(item.get("confidence", 0.0) or 0.0)
-        symbol = item.get("symbol", "")
-        timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
-        duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
-        entry_time_iso = item.get("entry_time_iso", "")
-        strategy = item.get("strategy", "")
-        exit_time_iso = item.get("exit_time_iso", "")
+        signal = item.get("signal")
+        entry_time_iso = item.get("entry_time_iso")
+        symbol = item.get("symbol")
+        timeframe = item.get("timeframe")
+        duration_type = item.get("duration_type")
 
         if signal not in ("BUY", "SELL"):
             continue
 
-        if confidence < MIN_ACTIVE_CONFIDENCE:
+        if not entry_time_iso:
             continue
 
-        if not exit_time_iso:
+        key = (
+            symbol,
+            signal,
+            timeframe,
+            duration_type,
+            entry_time_iso,
+        )
+
+        if key in existing_keys:
             continue
 
-        try:
-            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
-        except Exception:
-            continue
-
-        if exit_dt <= now_utc:
-            continue
-
-        signal_id = f"{symbol}_{signal}_{timeframe}_{duration_type}_{entry_time_iso}"
-
-        active_item = {
-            "id": signal_id,
-            "symbol": symbol,
-            "signal": signal,
-            "confidence": confidence,
-            "signal_quality": item.get("signal_quality", 0.0),
-            "price": item.get("price"),
-            "entry_price": item.get("entry_price"),
-            "tp": item.get("tp"),
-            "sl": item.get("sl"),
-            "rsi": item.get("rsi", 0.0),
-            "market_regime": item.get("market_regime", "UNKNOWN"),
-            "higher_timeframe_bias": item.get("higher_timeframe_bias", "NONE"),
-            "strategy": strategy,
-            "timeframe": timeframe,
-            "duration_type": duration_type,
-            "recommended_expiry": item.get("recommended_expiry", ""),
-            "entry_time": item.get("entry_time", ""),
-            "exit_time": item.get("exit_time", ""),
-            "entry_time_iso": entry_time_iso,
-            "exit_time_iso": exit_time_iso,
-            "reason": item.get("reason", ""),
-            "chart_prices": item.get("chart_prices", []),
-            "chart_labels": item.get("chart_labels", []),
-            "candle_buy_bonus": item.get("candle_buy_bonus", 0.0),
-            "candle_sell_bonus": item.get("candle_sell_bonus", 0.0),
-            "level_buy_bonus": item.get("level_buy_bonus", 0.0),
-            "level_sell_bonus": item.get("level_sell_bonus", 0.0),
-            "trend_strength": item.get("trend_strength", 0.0),
-            "volatility_ratio": item.get("volatility_ratio", 0.0),
-            "result": "OPEN",
-            "saved_at": now_iso(),
-        }
-
-        new_active.append(active_item)
-
-    active_signals = new_active
+        active_signals.append({
+            **item,
+            "status": "active",
+            "closed_at_iso": None,
+            "result": None,
+        })
+        existing_keys.add(key)
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
 
