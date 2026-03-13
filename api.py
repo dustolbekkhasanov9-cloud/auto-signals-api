@@ -113,12 +113,13 @@ def add_signals_to_active(items: list[dict]) -> None:
         if key in existing_keys:
             continue
 
-            active_signals.append({
-        **item,
-        "status": "active",
-        "closed_at_iso": None,
-        "result": "OPEN",
-    })
+        active_signals.append({
+            **item,
+            "status": "active",
+            "closed_at_iso": None,
+            "result": "OPEN",
+        })
+        existing_keys.add(key)
         existing_keys.add(key)
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
