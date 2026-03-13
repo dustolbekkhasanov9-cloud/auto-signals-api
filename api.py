@@ -1,12 +1,14 @@
 from news_feed import build_feed
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import asyncio
 import logging
 from typing import Dict, Any
 
 from fastapi import FastAPI, Query, HTTPException
 from signal_engine import analyze_symbol
+import pandas as pd
+import yfinance as yf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autosignal-api")
@@ -41,8 +43,52 @@ signal_history: list[dict] = []
 MAX_HISTORY_ITEMS = 300
 
 
+def parse_iso_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def get_historical_exit_price(symbol: str, exit_time_iso: str) -> float | None:
+    try:
+        exit_dt = parse_iso_utc(exit_time_iso)
+
+        start_dt = exit_dt - timedelta(minutes=10)
+        end_dt = exit_dt + timedelta(minutes=2)
+
+        df = yf.download(
+            symbol,
+            start=start_dt,
+            end=end_dt,
+            interval="1m",
+            progress=False,
+        )
+
+        if df is None or df.empty:
+            return None
+
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        eligible = df[df.index <= exit_dt]
+
+        if eligible.empty:
+            return None
+
+        close_value = eligible.iloc[-1]["Close"]
+
+        if hasattr(close_value, "item"):
+            close_value = close_value.item()
+
+        return float(close_value)
+
+    except Exception as e:
+        logger.exception("Historical price error %s %s", symbol, e)
+        return None
 
 
 def make_cache_key(symbol: str, timeframe: str, duration_type: str) -> str:
@@ -113,14 +159,17 @@ def add_signals_to_active(items: list[dict]) -> None:
         if key in existing_keys:
             continue
 
-        active_signals.append({
-            **item,
-            "status": "active",
-            "closed_at_iso": None,
-            "result": "OPEN",
-        })
+        active_signals.append(
+            {
+                **item,
+                "status": "active",
+                "closed_at_iso": None,
+                "result": "OPEN",
+            }
+        )
         existing_keys.add(key)
-        existing_keys.add(key)
+
+
 def add_signals_to_history(items: list[dict]) -> None:
     global signal_history
 
@@ -201,14 +250,16 @@ def update_closed_history_results() -> None:
         exit_time_iso = item.get("exit_time_iso", "")
         if not exit_time_iso:
             item["result"] = "CLOSED"
+            item["closed_at_iso"] = now_iso()
             if not history_duplicate_exists(item):
                 signal_history.insert(0, item)
             continue
 
         try:
-            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
+            exit_dt = parse_iso_utc(exit_time_iso)
         except Exception:
             item["result"] = "CLOSED"
+            item["closed_at_iso"] = now_iso()
             if not history_duplicate_exists(item):
                 signal_history.insert(0, item)
             continue
@@ -218,51 +269,35 @@ def update_closed_history_results() -> None:
             continue
 
         symbol = item.get("symbol")
-        timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
-        duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
-
         if not symbol:
             item["result"] = "CLOSED"
+            item["closed_at_iso"] = now_iso()
             if not history_duplicate_exists(item):
                 signal_history.insert(0, item)
             continue
 
-        cache_key = make_cache_key(symbol, timeframe, duration_type)
-        latest = scan_cache.get(cache_key)
-
-        if not latest:
-            default_key = make_cache_key(symbol, DEFAULT_TIMEFRAME, DEFAULT_DURATION_TYPE)
-            latest = scan_cache.get(default_key) or signal_cache.get(symbol)
-
-        if not latest:
-            item["result"] = "CLOSED"
-            if not history_duplicate_exists(item):
-                signal_history.insert(0, item)
-            continue
-
-        current_price = latest.get("price")
         entry_price = item.get("entry_price")
         signal = item.get("signal")
+        exit_price = get_historical_exit_price(symbol, exit_time_iso)
 
-        if current_price is None or entry_price is None or signal not in ("BUY", "SELL"):
-            item["result"] = "CLOSED"
-            if not history_duplicate_exists(item):
-                signal_history.insert(0, item)
+        if exit_price is None or entry_price is None or signal not in ("BUY", "SELL"):
+            still_active.append(item)
             continue
 
         try:
-            current_price = float(current_price)
+            exit_price = float(exit_price)
             entry_price = float(entry_price)
         except Exception:
-            item["result"] = "CLOSED"
-            if not history_duplicate_exists(item):
-                signal_history.insert(0, item)
+            still_active.append(item)
             continue
 
+        item["exit_price"] = exit_price
+        item["closed_at_iso"] = now_iso()
+
         if signal == "BUY":
-            item["result"] = "TP" if current_price >= entry_price else "SL"
+            item["result"] = "TP" if exit_price >= entry_price else "SL"
         elif signal == "SELL":
-            item["result"] = "TP" if current_price <= entry_price else "SL"
+            item["result"] = "TP" if exit_price <= entry_price else "SL"
         else:
             item["result"] = "CLOSED"
 
@@ -270,7 +305,9 @@ def update_closed_history_results() -> None:
             signal_history.insert(0, item)
 
     active_signals = still_active
-    signal_history = signal_history[:MAX_HISTORY_ITEMS]
+
+    if len(signal_history) > MAX_HISTORY_ITEMS:
+        signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
 
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
@@ -489,17 +526,15 @@ def get_active_signals(limit: int = 50):
             continue
 
         try:
-            exit_dt = datetime.fromisoformat(exit_time_iso.replace("Z", "+00:00"))
+            exit_dt = parse_iso_utc(exit_time_iso)
         except Exception:
             continue
 
-        # сигнал уже закончился
         if exit_dt <= now_utc:
             continue
 
         fresh_items.append(item)
 
-    # очищаем список от старых сигналов
     active_signals = fresh_items
 
     return {
@@ -507,7 +542,7 @@ def get_active_signals(limit: int = 50):
         "count": len(fresh_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
-        "server_now_utc": now_utc.isoformat()
+        "server_now_utc": now_utc.isoformat(),
     }
 
 
@@ -536,6 +571,8 @@ def get_history(limit: int = 50):
         "limit": limit,
         "last_updated_at": last_updated_at,
     }
+
+
 @app.get("/feed")
 def get_feed():
     return build_feed()
