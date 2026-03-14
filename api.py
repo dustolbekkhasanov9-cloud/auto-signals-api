@@ -672,7 +672,7 @@ def get_signals(
 
 
 @app.get("/active_signals")
-def get_active_signals(limit: int = 50):
+def get_active_signals(limit: int = 150):
     update_closed_history_results()
 
     now_utc = datetime.now(timezone.utc)
