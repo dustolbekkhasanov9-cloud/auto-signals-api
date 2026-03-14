@@ -386,6 +386,7 @@ def update_closed_history_results() -> None:
             continue
 
         exit_time_iso = item.get("exit_time_iso", "")
+
         if not exit_time_iso:
             closed_item = finalize_closed_signal(
                 item,
@@ -439,7 +440,13 @@ def update_closed_history_results() -> None:
             exit_price = price_map.get(exit_time_iso)
 
             if exit_price is None:
-                still_active.append(item)
+                closed_item = finalize_closed_signal(
+                    item,
+                    exit_price=None,
+                    close_reason="exit_price_not_found"
+                )
+                if not history_duplicate_exists(closed_item):
+                    signal_history.insert(0, closed_item)
                 continue
 
             closed_item = finalize_closed_signal(
