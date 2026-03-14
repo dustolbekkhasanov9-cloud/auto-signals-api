@@ -370,15 +370,28 @@ def update_closed_history_results() -> None:
             signal = item.get("signal")
             exit_price = price_map.get(exit_time_iso)
 
-            if exit_price is None or entry_price is None or signal not in ("BUY", "SELL"):
-                still_active.append(item)
+            if entry_price is None or signal not in ("BUY", "SELL"):
+                item["result"] = "CLOSED"
+                item["closed_at_iso"] = now_iso()
+                if not history_duplicate_exists(item):
+                    signal_history.insert(0, item)
+                continue
+
+            if exit_price is None:
+                item["result"] = "CLOSED"
+                item["closed_at_iso"] = now_iso()
+                if not history_duplicate_exists(item):
+                    signal_history.insert(0, item)
                 continue
 
             try:
                 exit_price = float(exit_price)
                 entry_price = float(entry_price)
             except Exception:
-                still_active.append(item)
+                item["result"] = "CLOSED"
+                item["closed_at_iso"] = now_iso()
+                if not history_duplicate_exists(item):
+                    signal_history.insert(0, item)
                 continue
 
             item["exit_price"] = exit_price
