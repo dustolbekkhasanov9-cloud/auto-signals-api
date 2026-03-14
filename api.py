@@ -9,7 +9,6 @@ import sqlite3
 import threading
 from typing import Any, Dict
 
-import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 
@@ -44,6 +43,8 @@ last_refresh_status: str = "starting"
 
 active_signals: list[dict] = []
 signal_history: list[dict] = []
+
+refresh_lock = asyncio.Lock()
 
 MAX_HISTORY_ITEMS = 300
 
@@ -151,9 +152,32 @@ def load_state_from_db() -> None:
                 signal_history = []
 
             signal_history = signal_history[:MAX_HISTORY_ITEMS]
-
         finally:
             conn.close()
+
+
+def deduplicate_active_signals() -> None:
+    global active_signals
+
+    seen = set()
+    unique_items = []
+
+    for item in active_signals:
+        key = (
+            item.get("symbol"),
+            item.get("signal"),
+            item.get("timeframe"),
+            item.get("duration_type"),
+            item.get("entry_time_iso"),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_items.append(item)
+
+    active_signals = unique_items
 
 
 def history_duplicate_exists(item: dict) -> bool:
@@ -393,63 +417,64 @@ async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -
 async def refresh_all_signals() -> None:
     global signal_cache, scan_cache, last_updated_at, last_refresh_status
 
-    logger.info("Фоновое обновление сигналов началось")
+    async with refresh_lock:
+        logger.info("Фоновое обновление сигналов началось")
 
-    tasks = []
-    task_keys = []
+        tasks = []
+        task_keys = []
 
-    for symbol in DEFAULT_SYMBOLS:
-        for timeframe in SCAN_TIMEFRAMES:
-            for duration_type in SCAN_DURATION_TYPES:
-                tasks.append(analyze_symbol_safe(symbol, timeframe, duration_type))
-                task_keys.append((symbol, timeframe, duration_type))
+        for symbol in DEFAULT_SYMBOLS:
+            for timeframe in SCAN_TIMEFRAMES:
+                for duration_type in SCAN_DURATION_TYPES:
+                    tasks.append(analyze_symbol_safe(symbol, timeframe, duration_type))
+                    task_keys.append((symbol, timeframe, duration_type))
 
-    results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
 
-    new_cache: Dict[str, Dict[str, Any]] = {}
-    new_scan_cache: Dict[str, Dict[str, Any]] = {}
-    all_results: list[dict] = []
+        new_cache: Dict[str, Dict[str, Any]] = {}
+        new_scan_cache: Dict[str, Dict[str, Any]] = {}
+        all_results: list[dict] = []
 
-    for i, item in enumerate(results):
-        symbol, timeframe, duration_type = task_keys[i]
+        for i, item in enumerate(results):
+            symbol, timeframe, duration_type = task_keys[i]
 
-        if not isinstance(item, dict):
-            continue
+            if not isinstance(item, dict):
+                continue
 
-        item["symbol"] = item.get("symbol", symbol)
-        item["timeframe"] = item.get("timeframe", timeframe)
-        item["duration_type"] = item.get("duration_type", duration_type)
+            item["symbol"] = item.get("symbol", symbol)
+            item["timeframe"] = item.get("timeframe", timeframe)
+            item["duration_type"] = item.get("duration_type", duration_type)
 
-        all_results.append(item)
+            all_results.append(item)
 
-        cache_key = make_cache_key(symbol, timeframe, duration_type)
-        new_scan_cache[cache_key] = item
+            cache_key = make_cache_key(symbol, timeframe, duration_type)
+            new_scan_cache[cache_key] = item
 
-        if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
-            item_symbol = item.get("symbol")
-            if item_symbol:
-                new_cache[item_symbol] = item
+            if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
+                item_symbol = item.get("symbol")
+                if item_symbol:
+                    new_cache[item_symbol] = item
 
-    if new_cache:
-        signal_cache = new_cache
-        scan_cache = new_scan_cache
-        last_updated_at = now_iso()
-        last_refresh_status = "ok"
+        if new_cache:
+            signal_cache = new_cache
+            scan_cache = new_scan_cache
+            last_updated_at = now_iso()
+            last_refresh_status = "ok"
 
-        add_signals_to_active(all_results)
-        update_closed_history_results()
+            add_signals_to_active(all_results)
+            update_closed_history_results()
 
-        logger.info(
-            "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s, history=%s",
-            len(signal_cache),
-            len(scan_cache),
-            len(all_results),
-            len(active_signals),
-            len(signal_history),
-        )
-    else:
-        last_refresh_status = "error"
-        logger.warning("Фоновое обновление не дало результатов")
+            logger.info(
+                "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s, history=%s",
+                len(signal_cache),
+                len(scan_cache),
+                len(all_results),
+                len(active_signals),
+                len(signal_history),
+            )
+        else:
+            last_refresh_status = "error"
+            logger.warning("Фоновое обновление не дало результатов")
 
 
 async def background_refresh_loop() -> None:
@@ -469,14 +494,16 @@ async def background_refresh_loop() -> None:
 async def lifespan(app: FastAPI):
     init_db()
     load_state_from_db()
+    deduplicate_active_signals()
     update_closed_history_results()
-
-    app.state.refresh_task = asyncio.create_task(background_refresh_loop())
+    save_state_to_db()
 
     try:
         await refresh_all_signals()
     except Exception as e:
         logger.exception("Ошибка стартового прогрева: %s", e)
+
+    app.state.refresh_task = asyncio.create_task(background_refresh_loop())
 
     yield
 
@@ -528,10 +555,7 @@ def get_signal(
     duration_type: str = Query(default=DEFAULT_DURATION_TYPE),
 ):
     if symbol not in DEFAULT_SYMBOLS:
-        raise HTTPException(
-            status_code=404,
-            detail="Символ не поддерживается",
-        )
+        raise HTTPException(status_code=404, detail="Символ не поддерживается")
 
     cache_key = make_cache_key(symbol, timeframe, duration_type)
     cached = scan_cache.get(cache_key)
