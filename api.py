@@ -441,17 +441,14 @@ def update_closed_history_results() -> None:
             exit_price = price_map.get(exit_time_iso)
 
             if exit_price is None:
-                closed_item = finalize_closed_signal(
-                    item,
-                    exit_price=None,
-                    close_reason="exit_price_unavailable"
-                )
-            else:
-                closed_item = finalize_closed_signal(
-                    item,
-                    exit_price=exit_price,
-                    close_reason="market_price_found"
-                )
+                still_active.append(item)
+                continue
+
+            closed_item = finalize_closed_signal(
+                item,
+                exit_price=exit_price,
+                close_reason="market_price_found"
+            )
 
             if not history_duplicate_exists(closed_item):
                 signal_history.insert(0, closed_item)
