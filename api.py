@@ -2,13 +2,18 @@ from news_feed import build_feed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 import asyncio
+import json
 import logging
-from typing import Dict, Any
+import os
+import sqlite3
+import threading
+from typing import Any, Dict
 
-from fastapi import FastAPI, Query, HTTPException
-from signal_engine import analyze_symbol
 import pandas as pd
 import yfinance as yf
+from fastapi import FastAPI, HTTPException, Query
+
+from signal_engine import analyze_symbol
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autosignal-api")
@@ -42,6 +47,9 @@ signal_history: list[dict] = []
 
 MAX_HISTORY_ITEMS = 300
 
+DB_PATH = os.environ.get("KIKI_DB_PATH", "kiki_state.db")
+db_lock = threading.Lock()
+
 
 def parse_iso_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
@@ -50,7 +58,124 @@ def parse_iso_utc(value: str) -> datetime:
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def get_historical_exit_prices_bulk(symbol: str, exit_times_iso: list[str]) -> dict[str, float | None]:
+
+def make_cache_key(symbol: str, timeframe: str, duration_type: str) -> str:
+    return f"{symbol}|{timeframe}|{duration_type}"
+
+
+def make_error_payload(symbol: str, reason: str) -> dict:
+    return {
+        "symbol": symbol,
+        "signal": "NONE",
+        "confidence": 0.0,
+        "reason": reason,
+    }
+
+
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                    state_key TEXT PRIMARY KEY,
+                    state_value TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def save_state_to_db() -> None:
+    global active_signals, signal_history
+
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO app_state (state_key, state_value)
+                VALUES (?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value
+                """,
+                ("active_signals", json.dumps(active_signals, ensure_ascii=False)),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO app_state (state_key, state_value)
+                VALUES (?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value
+                """,
+                ("signal_history", json.dumps(signal_history, ensure_ascii=False)),
+            )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_state_from_db() -> None:
+    global active_signals, signal_history
+
+    with db_lock:
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(
+                "SELECT state_key, state_value FROM app_state"
+            ).fetchall()
+
+            loaded: dict[str, str] = {
+                row["state_key"]: row["state_value"] for row in rows
+            }
+
+            active_raw = loaded.get("active_signals")
+            history_raw = loaded.get("signal_history")
+
+            active_signals = json.loads(active_raw) if active_raw else []
+            signal_history = json.loads(history_raw) if history_raw else []
+
+            if not isinstance(active_signals, list):
+                active_signals = []
+
+            if not isinstance(signal_history, list):
+                signal_history = []
+
+            signal_history = signal_history[:MAX_HISTORY_ITEMS]
+
+        finally:
+            conn.close()
+
+
+def history_duplicate_exists(item: dict) -> bool:
+    symbol = item.get("symbol")
+    signal = item.get("signal")
+    timeframe = item.get("timeframe")
+    duration_type = item.get("duration_type")
+    entry_time_iso = item.get("entry_time_iso")
+
+    return any(
+        h.get("symbol") == symbol
+        and h.get("signal") == signal
+        and h.get("timeframe") == timeframe
+        and h.get("duration_type") == duration_type
+        and h.get("entry_time_iso") == entry_time_iso
+        for h in signal_history
+    )
+
+
+def get_historical_exit_prices_bulk(
+    symbol: str, exit_times_iso: list[str]
+) -> dict[str, float | None]:
     result: dict[str, float | None] = {}
 
     if not exit_times_iso:
@@ -97,75 +222,6 @@ def get_historical_exit_prices_bulk(symbol: str, exit_times_iso: list[str]) -> d
         logger.exception("Bulk historical price error %s %s", symbol, e)
         return {x: None for x in exit_times_iso}
 
-def get_historical_exit_price(symbol: str, exit_time_iso: str) -> float | None:
-    try:
-        exit_dt = parse_iso_utc(exit_time_iso)
-
-        start_dt = exit_dt - timedelta(minutes=10)
-        end_dt = exit_dt + timedelta(minutes=2)
-
-        df = yf.download(
-            symbol,
-            start=start_dt,
-            end=end_dt,
-            interval="1m",
-            progress=False,
-        )
-
-        if df is None or df.empty:
-            return None
-
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
-
-        eligible = df[df.index <= exit_dt]
-
-        if eligible.empty:
-            return None
-
-        close_value = eligible.iloc[-1]["Close"]
-
-        if hasattr(close_value, "item"):
-            close_value = close_value.item()
-
-        return float(close_value)
-
-    except Exception as e:
-        logger.exception("Historical price error %s %s", symbol, e)
-        return None
-
-
-def make_cache_key(symbol: str, timeframe: str, duration_type: str) -> str:
-    return f"{symbol}|{timeframe}|{duration_type}"
-
-
-def make_error_payload(symbol: str, reason: str) -> dict:
-    return {
-        "symbol": symbol,
-        "signal": "NONE",
-        "confidence": 0.0,
-        "reason": reason,
-    }
-
-
-def history_duplicate_exists(item: dict) -> bool:
-    symbol = item.get("symbol")
-    signal = item.get("signal")
-    timeframe = item.get("timeframe")
-    duration_type = item.get("duration_type")
-    entry_time_iso = item.get("entry_time_iso")
-
-    return any(
-        h.get("symbol") == symbol
-        and h.get("signal") == signal
-        and h.get("timeframe") == timeframe
-        and h.get("duration_type") == duration_type
-        and h.get("entry_time_iso") == entry_time_iso
-        for h in signal_history
-    )
-
 
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
@@ -180,6 +236,8 @@ def add_signals_to_active(items: list[dict]) -> None:
         )
         for s in active_signals
     }
+
+    state_changed = False
 
     for item in items:
         signal = item.get("signal")
@@ -214,72 +272,10 @@ def add_signals_to_active(items: list[dict]) -> None:
             }
         )
         existing_keys.add(key)
+        state_changed = True
 
-
-def add_signals_to_history(items: list[dict]) -> None:
-    global signal_history
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        signal = item.get("signal", "NONE")
-        symbol = item.get("symbol", "")
-        timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
-        duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
-        entry_time_iso = item.get("entry_time_iso", "")
-        strategy = item.get("strategy", "")
-
-        if signal == "NONE":
-            continue
-
-        history_item = {
-            "symbol": symbol,
-            "signal": signal,
-            "confidence": item.get("confidence", 0.0),
-            "signal_quality": item.get("signal_quality", 0.0),
-            "price": item.get("price"),
-            "entry_price": item.get("entry_price"),
-            "tp": item.get("tp"),
-            "sl": item.get("sl"),
-            "rsi": item.get("rsi", 0.0),
-            "market_regime": item.get("market_regime", "UNKNOWN"),
-            "higher_timeframe_bias": item.get("higher_timeframe_bias", "NONE"),
-            "strategy": strategy,
-            "timeframe": timeframe,
-            "duration_type": duration_type,
-            "recommended_expiry": item.get("recommended_expiry", ""),
-            "entry_time": item.get("entry_time", ""),
-            "exit_time": item.get("exit_time", ""),
-            "entry_time_iso": entry_time_iso,
-            "exit_time_iso": item.get("exit_time_iso", ""),
-            "reason": item.get("reason", ""),
-            "chart_prices": item.get("chart_prices", []),
-            "chart_labels": item.get("chart_labels", []),
-            "candle_buy_bonus": item.get("candle_buy_bonus", 0.0),
-            "candle_sell_bonus": item.get("candle_sell_bonus", 0.0),
-            "level_buy_bonus": item.get("level_buy_bonus", 0.0),
-            "level_sell_bonus": item.get("level_sell_bonus", 0.0),
-            "trend_strength": item.get("trend_strength", 0.0),
-            "volatility_ratio": item.get("volatility_ratio", 0.0),
-            "result": "OPEN",
-            "saved_at": now_iso(),
-        }
-
-        duplicate_exists = any(
-            h.get("symbol") == symbol
-            and h.get("signal") == signal
-            and h.get("timeframe") == timeframe
-            and h.get("duration_type") == duration_type
-            and h.get("entry_time_iso") == entry_time_iso
-            and h.get("strategy") == strategy
-            for h in signal_history
-        )
-
-        if not duplicate_exists:
-            signal_history.insert(0, history_item)
-
-    signal_history = signal_history[:MAX_HISTORY_ITEMS]
+    if state_changed:
+        save_state_to_db()
 
 
 def update_closed_history_results() -> None:
@@ -365,9 +361,8 @@ def update_closed_history_results() -> None:
                 signal_history.insert(0, item)
 
     active_signals = still_active
-
-    if len(signal_history) > MAX_HISTORY_ITEMS:
-        signal_history = signal_history[:MAX_HISTORY_ITEMS]
+    signal_history = signal_history[:MAX_HISTORY_ITEMS]
+    save_state_to_db()
 
 
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
@@ -445,11 +440,12 @@ async def refresh_all_signals() -> None:
         update_closed_history_results()
 
         logger.info(
-            "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s",
+            "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s, history=%s",
             len(signal_cache),
             len(scan_cache),
             len(all_results),
             len(active_signals),
+            len(signal_history),
         )
     else:
         last_refresh_status = "error"
@@ -471,6 +467,10 @@ async def background_refresh_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
+    load_state_from_db()
+    update_closed_history_results()
+
     app.state.refresh_task = asyncio.create_task(background_refresh_loop())
 
     try:
@@ -500,6 +500,8 @@ def root():
         "symbols_count": len(DEFAULT_SYMBOLS),
         "cache_size": len(signal_cache),
         "scan_cache_size": len(scan_cache),
+        "active_signals_count": len(active_signals),
+        "history_count": len(signal_history),
         "refresh_seconds": REFRESH_SECONDS,
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
@@ -512,6 +514,8 @@ def health():
         "status": "ok",
         "cache_ready": len(signal_cache) > 0,
         "scan_cache_ready": len(scan_cache) > 0,
+        "active_signals_count": len(active_signals),
+        "history_count": len(signal_history),
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
     }
@@ -570,8 +574,6 @@ def get_signals(
 
 @app.get("/active_signals")
 def get_active_signals(limit: int = 50):
-    global active_signals
-
     now_utc = datetime.now(timezone.utc)
     fresh_items: list[dict] = []
 
@@ -592,8 +594,6 @@ def get_active_signals(limit: int = 50):
             continue
 
         fresh_items.append(item)
-
-    active_signals = fresh_items
 
     return {
         "items": fresh_items[:limit],
