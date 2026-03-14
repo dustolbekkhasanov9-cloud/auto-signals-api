@@ -169,6 +169,8 @@ def deduplicate_active_signals() -> None:
             item.get("timeframe"),
             item.get("duration_type"),
             item.get("entry_time_iso"),
+            item.get("exit_time_iso"),
+            item.get("entry_price"),
         )
 
         if key in seen:
@@ -257,6 +259,8 @@ def add_signals_to_active(items: list[dict]) -> None:
             s.get("timeframe"),
             s.get("duration_type"),
             s.get("entry_time_iso"),
+            s.get("exit_time_iso"),
+            s.get("entry_price"),
         )
         for s in active_signals
     }
@@ -266,6 +270,8 @@ def add_signals_to_active(items: list[dict]) -> None:
     for item in items:
         signal = item.get("signal")
         entry_time_iso = item.get("entry_time_iso")
+        exit_time_iso = item.get("exit_time_iso")
+        entry_price = item.get("entry_price")
         symbol = item.get("symbol")
         timeframe = item.get("timeframe")
         duration_type = item.get("duration_type")
@@ -282,10 +288,15 @@ def add_signals_to_active(items: list[dict]) -> None:
             timeframe,
             duration_type,
             entry_time_iso,
+            exit_time_iso,
+            entry_price,
         )
 
         if key in existing_keys:
+            logger.info("DUPLICATE SKIPPED: %s", key)
             continue
+
+        logger.info("ACTIVE SIGNAL ADDED: %s", key)
 
         active_signals.append(
             {
@@ -462,6 +473,7 @@ async def refresh_all_signals() -> None:
             last_refresh_status = "ok"
 
             add_signals_to_active(all_results)
+            deduplicate_active_signals()
             update_closed_history_results()
 
             logger.info(
@@ -600,6 +612,7 @@ def get_signals(
 def get_active_signals(limit: int = 50):
     now_utc = datetime.now(timezone.utc)
     fresh_items: list[dict] = []
+    seen = set()
 
     for item in active_signals:
         if item.get("result") != "OPEN":
@@ -617,6 +630,21 @@ def get_active_signals(limit: int = 50):
         if exit_dt <= now_utc:
             continue
 
+        dedupe_key = (
+            item.get("symbol"),
+            item.get("signal"),
+            item.get("timeframe"),
+            item.get("duration_type"),
+            item.get("entry_time_iso"),
+            item.get("exit_time_iso"),
+            item.get("entry_price"),
+        )
+
+        if dedupe_key in seen:
+            logger.info("ACTIVE API DEDUPE SKIPPED: %s", dedupe_key)
+            continue
+
+        seen.add(dedupe_key)
         fresh_items.append(item)
 
     return {
