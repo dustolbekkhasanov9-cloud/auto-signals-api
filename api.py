@@ -156,6 +156,40 @@ def load_state_from_db() -> None:
             conn.close()
 
 
+def make_signal_key(item: dict) -> tuple:
+    entry_time_iso = item.get("entry_time_iso", "") or ""
+    exit_time_iso = item.get("exit_time_iso", "") or ""
+
+    if entry_time_iso:
+        try:
+            entry_time_iso = parse_iso_utc(entry_time_iso).strftime("%Y-%m-%dT%H:%M")
+        except Exception:
+            entry_time_iso = str(entry_time_iso)[:16]
+
+    if exit_time_iso:
+        try:
+            exit_time_iso = parse_iso_utc(exit_time_iso).strftime("%Y-%m-%dT%H:%M")
+        except Exception:
+            exit_time_iso = str(exit_time_iso)[:16]
+
+    entry_price = item.get("entry_price")
+    if entry_price is not None:
+        try:
+            entry_price = round(float(entry_price), 5)
+        except Exception:
+            entry_price = None
+
+    return (
+        item.get("symbol"),
+        item.get("signal"),
+        item.get("timeframe"),
+        item.get("duration_type"),
+        entry_time_iso,
+        exit_time_iso,
+        entry_price,
+    )
+
+
 def deduplicate_active_signals() -> None:
     global active_signals
 
@@ -164,10 +198,8 @@ def deduplicate_active_signals() -> None:
 
     for item in active_signals:
         key = make_signal_key(item)
-
         if key in seen:
             continue
-
         seen.add(key)
         unique_items.append(item)
 
@@ -240,39 +272,6 @@ def get_historical_exit_prices_bulk(
         logger.exception("Bulk historical price error %s %s", symbol, e)
         return {x: None for x in exit_times_iso}
 
-def make_signal_key(item: dict) -> tuple:
-    entry_time_iso = item.get("entry_time_iso", "") or ""
-    exit_time_iso = item.get("exit_time_iso", "") or ""
-
-    if entry_time_iso:
-        try:
-            entry_time_iso = parse_iso_utc(entry_time_iso).strftime("%Y-%m-%dT%H:%M")
-        except Exception:
-            entry_time_iso = str(entry_time_iso)[:16]
-
-    if exit_time_iso:
-        try:
-            exit_time_iso = parse_iso_utc(exit_time_iso).strftime("%Y-%m-%dT%H:%M")
-        except Exception:
-            exit_time_iso = str(exit_time_iso)[:16]
-
-    entry_price = item.get("entry_price")
-    if entry_price is not None:
-        try:
-            entry_price = round(float(entry_price), 5)
-        except Exception:
-            entry_price = None
-
-    return (
-        item.get("symbol"),
-        item.get("signal"),
-        item.get("timeframe"),
-        item.get("duration_type"),
-        entry_time_iso,
-        exit_time_iso,
-        entry_price,
-    )
-
 
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
@@ -311,6 +310,7 @@ def add_signals_to_active(items: list[dict]) -> None:
 
     if state_changed:
         save_state_to_db()
+
 
 def update_closed_history_results() -> None:
     global active_signals, signal_history
@@ -609,6 +609,8 @@ def get_signals(
 
 @app.get("/active_signals")
 def get_active_signals(limit: int = 50):
+    update_closed_history_results()
+
     now_utc = datetime.now(timezone.utc)
     fresh_items: list[dict] = []
     seen = set()
@@ -661,6 +663,8 @@ async def manual_refresh():
 
 @app.get("/history")
 def get_history(limit: int = 50):
+    update_closed_history_results()
+
     closed_items = [
         item for item in signal_history
         if item.get("result") in ("TP", "SL", "CLOSED")
