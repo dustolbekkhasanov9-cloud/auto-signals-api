@@ -163,15 +163,7 @@ def deduplicate_active_signals() -> None:
     unique_items = []
 
     for item in active_signals:
-        key = (
-            item.get("symbol"),
-            item.get("signal"),
-            item.get("timeframe"),
-            item.get("duration_type"),
-            item.get("entry_time_iso"),
-            item.get("exit_time_iso"),
-            item.get("entry_price"),
-        )
+        key = make_signal_key(item)
 
         if key in seen:
             continue
@@ -248,33 +240,49 @@ def get_historical_exit_prices_bulk(
         logger.exception("Bulk historical price error %s %s", symbol, e)
         return {x: None for x in exit_times_iso}
 
+def make_signal_key(item: dict) -> tuple:
+    entry_time_iso = item.get("entry_time_iso", "") or ""
+    exit_time_iso = item.get("exit_time_iso", "") or ""
+
+    if entry_time_iso:
+        try:
+            entry_time_iso = parse_iso_utc(entry_time_iso).strftime("%Y-%m-%dT%H:%M")
+        except Exception:
+            entry_time_iso = str(entry_time_iso)[:16]
+
+    if exit_time_iso:
+        try:
+            exit_time_iso = parse_iso_utc(exit_time_iso).strftime("%Y-%m-%dT%H:%M")
+        except Exception:
+            exit_time_iso = str(exit_time_iso)[:16]
+
+    entry_price = item.get("entry_price")
+    if entry_price is not None:
+        try:
+            entry_price = round(float(entry_price), 5)
+        except Exception:
+            entry_price = None
+
+    return (
+        item.get("symbol"),
+        item.get("signal"),
+        item.get("timeframe"),
+        item.get("duration_type"),
+        entry_time_iso,
+        exit_time_iso,
+        entry_price,
+    )
+
 
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
-    existing_keys = {
-        (
-            s.get("symbol"),
-            s.get("signal"),
-            s.get("timeframe"),
-            s.get("duration_type"),
-            s.get("entry_time_iso"),
-            s.get("exit_time_iso"),
-            s.get("entry_price"),
-        )
-        for s in active_signals
-    }
-
+    existing_keys = {make_signal_key(s) for s in active_signals}
     state_changed = False
 
     for item in items:
         signal = item.get("signal")
         entry_time_iso = item.get("entry_time_iso")
-        exit_time_iso = item.get("exit_time_iso")
-        entry_price = item.get("entry_price")
-        symbol = item.get("symbol")
-        timeframe = item.get("timeframe")
-        duration_type = item.get("duration_type")
 
         if signal not in ("BUY", "SELL"):
             continue
@@ -282,15 +290,7 @@ def add_signals_to_active(items: list[dict]) -> None:
         if not entry_time_iso:
             continue
 
-        key = (
-            symbol,
-            signal,
-            timeframe,
-            duration_type,
-            entry_time_iso,
-            exit_time_iso,
-            entry_price,
-        )
+        key = make_signal_key(item)
 
         if key in existing_keys:
             logger.info("DUPLICATE SKIPPED: %s", key)
@@ -311,7 +311,6 @@ def add_signals_to_active(items: list[dict]) -> None:
 
     if state_changed:
         save_state_to_db()
-
 
 def update_closed_history_results() -> None:
     global active_signals, signal_history
@@ -630,15 +629,7 @@ def get_active_signals(limit: int = 50):
         if exit_dt <= now_utc:
             continue
 
-        dedupe_key = (
-            item.get("symbol"),
-            item.get("signal"),
-            item.get("timeframe"),
-            item.get("duration_type"),
-            item.get("entry_time_iso"),
-            item.get("exit_time_iso"),
-            item.get("entry_price"),
-        )
+        dedupe_key = make_signal_key(item)
 
         if dedupe_key in seen:
             logger.info("ACTIVE API DEDUPE SKIPPED: %s", dedupe_key)
