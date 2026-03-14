@@ -572,8 +572,6 @@ def get_signals(
 def get_active_signals(limit: int = 50):
     global active_signals
 
-    update_closed_history_results()
-
     now_utc = datetime.now(timezone.utc)
     fresh_items: list[dict] = []
 
