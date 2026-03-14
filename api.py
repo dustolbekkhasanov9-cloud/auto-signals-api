@@ -212,6 +212,7 @@ def history_duplicate_exists(item: dict) -> bool:
     timeframe = item.get("timeframe")
     duration_type = item.get("duration_type")
     entry_time_iso = item.get("entry_time_iso")
+    exit_time_iso = item.get("exit_time_iso")
 
     return any(
         h.get("symbol") == symbol
@@ -219,6 +220,7 @@ def history_duplicate_exists(item: dict) -> bool:
         and h.get("timeframe") == timeframe
         and h.get("duration_type") == duration_type
         and h.get("entry_time_iso") == entry_time_iso
+        and h.get("exit_time_iso") == exit_time_iso
         for h in signal_history
     )
 
@@ -271,6 +273,67 @@ def get_historical_exit_prices_bulk(
     except Exception as e:
         logger.exception("Bulk historical price error %s %s", symbol, e)
         return {x: None for x in exit_times_iso}
+
+
+def finalize_closed_signal(
+    item: dict,
+    exit_price: float | None,
+    close_reason: str = ""
+) -> dict:
+    item = dict(item)
+    item["closed_at_iso"] = now_iso()
+    item["close_reason"] = close_reason or ""
+
+    entry_price = item.get("entry_price")
+    signal = item.get("signal")
+
+    if entry_price is None or signal not in ("BUY", "SELL"):
+        item["result"] = "CLOSED"
+        item["exit_price"] = None
+        item["profit_value"] = None
+        item["profit_percent"] = None
+        return item
+
+    try:
+        entry_price = float(entry_price)
+    except Exception:
+        item["result"] = "CLOSED"
+        item["exit_price"] = None
+        item["profit_value"] = None
+        item["profit_percent"] = None
+        return item
+
+    if exit_price is None:
+        item["result"] = "CLOSED"
+        item["exit_price"] = None
+        item["profit_value"] = None
+        item["profit_percent"] = None
+        return item
+
+    try:
+        exit_price = float(exit_price)
+    except Exception:
+        item["result"] = "CLOSED"
+        item["exit_price"] = None
+        item["profit_value"] = None
+        item["profit_percent"] = None
+        return item
+
+    item["exit_price"] = round(exit_price, 5)
+
+    if signal == "BUY":
+        profit_value = exit_price - entry_price
+        item["result"] = "TP" if exit_price >= entry_price else "SL"
+    else:
+        profit_value = entry_price - exit_price
+        item["result"] = "TP" if exit_price <= entry_price else "SL"
+
+    profit_percent = (profit_value / entry_price * 100) if entry_price else 0.0
+
+    item["profit_value"] = round(profit_value, 5)
+    item["profit_percent"] = round(profit_percent, 3)
+
+    return item
 
 
 def add_signals_to_active(items: list[dict]) -> None:
@@ -326,19 +389,25 @@ def update_closed_history_results() -> None:
 
         exit_time_iso = item.get("exit_time_iso", "")
         if not exit_time_iso:
-            item["result"] = "CLOSED"
-            item["closed_at_iso"] = now_iso()
-            if not history_duplicate_exists(item):
-                signal_history.insert(0, item)
+            closed_item = finalize_closed_signal(
+                item,
+                exit_price=None,
+                close_reason="missing_exit_time"
+            )
+            if not history_duplicate_exists(closed_item):
+                signal_history.insert(0, closed_item)
             continue
 
         try:
             exit_dt = parse_iso_utc(exit_time_iso)
         except Exception:
-            item["result"] = "CLOSED"
-            item["closed_at_iso"] = now_iso()
-            if not history_duplicate_exists(item):
-                signal_history.insert(0, item)
+            closed_item = finalize_closed_signal(
+                item,
+                exit_price=None,
+                close_reason="bad_exit_time"
+            )
+            if not history_duplicate_exists(closed_item):
+                signal_history.insert(0, closed_item)
             continue
 
         if exit_dt > now_utc:
@@ -347,10 +416,13 @@ def update_closed_history_results() -> None:
 
         symbol = item.get("symbol")
         if not symbol:
-            item["result"] = "CLOSED"
-            item["closed_at_iso"] = now_iso()
-            if not history_duplicate_exists(item):
-                signal_history.insert(0, item)
+            closed_item = finalize_closed_signal(
+                item,
+                exit_price=None,
+                close_reason="missing_symbol"
+            )
+            if not history_duplicate_exists(closed_item):
+                signal_history.insert(0, closed_item)
             continue
 
         expired_items_by_symbol.setdefault(symbol, []).append(item)
@@ -366,46 +438,23 @@ def update_closed_history_results() -> None:
 
         for item in items:
             exit_time_iso = item.get("exit_time_iso", "")
-            entry_price = item.get("entry_price")
-            signal = item.get("signal")
             exit_price = price_map.get(exit_time_iso)
 
-            if entry_price is None or signal not in ("BUY", "SELL"):
-                item["result"] = "CLOSED"
-                item["closed_at_iso"] = now_iso()
-                if not history_duplicate_exists(item):
-                    signal_history.insert(0, item)
-                continue
-
             if exit_price is None:
-                item["result"] = "CLOSED"
-                item["closed_at_iso"] = now_iso()
-                if not history_duplicate_exists(item):
-                    signal_history.insert(0, item)
-                continue
-
-            try:
-                exit_price = float(exit_price)
-                entry_price = float(entry_price)
-            except Exception:
-                item["result"] = "CLOSED"
-                item["closed_at_iso"] = now_iso()
-                if not history_duplicate_exists(item):
-                    signal_history.insert(0, item)
-                continue
-
-            item["exit_price"] = exit_price
-            item["closed_at_iso"] = now_iso()
-
-            if signal == "BUY":
-                item["result"] = "TP" if exit_price >= entry_price else "SL"
-            elif signal == "SELL":
-                item["result"] = "TP" if exit_price <= entry_price else "SL"
+                closed_item = finalize_closed_signal(
+                    item,
+                    exit_price=None,
+                    close_reason="exit_price_unavailable"
+                )
             else:
-                item["result"] = "CLOSED"
+                closed_item = finalize_closed_signal(
+                    item,
+                    exit_price=exit_price,
+                    close_reason="market_price_found"
+                )
 
-            if not history_duplicate_exists(item):
-                signal_history.insert(0, item)
+            if not history_duplicate_exists(closed_item):
+                signal_history.insert(0, closed_item)
 
     active_signals = still_active
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
