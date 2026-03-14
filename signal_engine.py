@@ -9,14 +9,6 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 
 DEFAULT_TIMEFRAME = "1h"
-HIGHER_TIMEFRAME_MAP = {
-    "5m": "15m",
-    "10m": "30m",
-    "15m": "1h",
-    "30m": "1h",
-    "1h": "1d",
-    "1d": None,
-}
 MULTI_TIMEFRAME_MAP = {
     "5m": {"confirm": "15m", "trend": "1h"},
     "10m": {"confirm": "30m", "trend": "1h"},
@@ -73,7 +65,12 @@ CHART_POINTS_MAP = {
 }
 
 
-def empty_signal_payload(symbol: str, reason: str, timeframe: str = DEFAULT_TIMEFRAME, duration_type: str = DEFAULT_DURATION_TYPE) -> dict:
+def empty_signal_payload(
+    symbol: str,
+    reason: str,
+    timeframe: str = DEFAULT_TIMEFRAME,
+    duration_type: str = DEFAULT_DURATION_TYPE,
+) -> dict:
     return {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -90,14 +87,12 @@ def empty_signal_payload(symbol: str, reason: str, timeframe: str = DEFAULT_TIME
         "confirm_bias": "NONE",
         "trend_bias": "NONE",
         "strategy": "Нет сигнала",
-
         "candle_buy_bonus": 0.0,
         "candle_sell_bonus": 0.0,
         "level_buy_bonus": 0.0,
         "level_sell_bonus": 0.0,
         "trend_strength": 0.0,
         "volatility_ratio": 0.0,
-
         "recommended_expiry": "",
         "chart_prices": [],
         "chart_labels": [],
@@ -141,10 +136,12 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     ohlcv["High"] = df["High"].resample(rule).max()
     ohlcv["Low"] = df["Low"].resample(rule).min()
     ohlcv["Close"] = df["Close"].resample(rule).last()
+
     if "Volume" in df.columns:
         ohlcv["Volume"] = df["Volume"].resample(rule).sum()
     else:
         ohlcv["Volume"] = 0
+
     ohlcv.dropna(inplace=True)
     return ohlcv
 
@@ -157,8 +154,10 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
     days = period_to_days(period)
 
     try:
-        period1 = int((datetime.utcnow() - timedelta(days=days)).timestamp())
-        period2 = int(datetime.utcnow().timestamp())
+        now_utc = datetime.now(timezone.utc)
+        period1 = int((now_utc - timedelta(days=days)).timestamp())
+        period2 = int(now_utc.timestamp())
+
         url = (
             f"https://query1.finance.yahoo.com/v8/finance/chart/"
             f"{symbol}?period1={period1}&period2={period2}&interval={fetch_interval}"
@@ -203,6 +202,7 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
                 threads=False,
                 auto_adjust=True,
             )
+
             if df is None or df.empty:
                 return None
 
@@ -265,7 +265,11 @@ def compute_macd(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
     return macd_line, signal_line, hist
 
 
-def compute_bollinger(series: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+def compute_bollinger(
+    series: pd.Series,
+    period: int = 20,
+    num_std: float = 2.0,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
     mid = series.rolling(period).mean()
     std = series.rolling(period).std()
     upper = mid + num_std * std
@@ -285,6 +289,39 @@ def compute_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     ha["HA_High"] = pd.concat([df["High"], ha["HA_Open"], ha["HA_Close"]], axis=1).max(axis=1)
     ha["HA_Low"] = pd.concat([df["Low"], ha["HA_Open"], ha["HA_Close"]], axis=1).min(axis=1)
     return ha
+
+
+def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    df["RSI"] = compute_rsi(df["Close"], RSI_PERIOD)
+    df["ATR"] = compute_atr(df, ATR_PERIOD)
+    df["EMA20"] = ema(df["Close"], 20)
+    df["EMA50"] = ema(df["Close"], 50)
+
+    macd_line, signal_line, macd_hist = compute_macd(df["Close"])
+    df["MACD"] = macd_line
+    df["MACD_SIGNAL"] = signal_line
+    df["MACD_HIST"] = macd_hist
+
+    bb_lower, bb_mid, bb_upper = compute_bollinger(df["Close"], 20, 2.0)
+    df["BB_LOWER"] = bb_lower
+    df["BB_MID"] = bb_mid
+    df["BB_UPPER"] = bb_upper
+
+    ha = compute_heikin_ashi(df)
+    df["HA_Open"] = ha["HA_Open"]
+    df["HA_Close"] = ha["HA_Close"]
+    df["HA_High"] = ha["HA_High"]
+    df["HA_Low"] = ha["HA_Low"]
+
+    df["ATR_SLOW"] = df["ATR"].rolling(20).mean()
+    df["VOLATILITY_RATIO"] = (df["ATR"] / df["ATR_SLOW"]).replace([float("inf"), -float("inf")], 0)
+    df["EMA_GAP"] = (df["EMA20"] - df["EMA50"]).abs()
+    df["TREND_STRENGTH"] = (df["EMA_GAP"] / df["ATR"]).replace([float("inf"), -float("inf")], 0)
+
+    df.dropna(inplace=True)
+    return df
 
 
 def detect_market_regime(df: pd.DataFrame) -> str:
@@ -345,26 +382,6 @@ def detect_trend_bias(df: pd.DataFrame) -> str:
     return "NONE"
 
 
-def get_higher_timeframe_bias(symbol: str, timeframe: str) -> str:
-    higher_tf = HIGHER_TIMEFRAME_MAP.get(timeframe)
-
-    if not higher_tf:
-        return "NONE"
-
-    higher_df = fetch_data(symbol, timeframe=higher_tf)
-    if higher_df is None or len(higher_df) < 60:
-        return "NONE"
-
-    higher_df = build_indicators(higher_df)
-    if higher_df is None or higher_df.empty or len(higher_df) < 30:
-        return "NONE"
-
-    signal_df = higher_df.iloc[:-1].copy()
-    if signal_df.empty or len(signal_df) < 20:
-        return "NONE"
-
-    return detect_trend_bias(signal_df)
-    
 def get_timeframe_bias(symbol: str, timeframe: str | None) -> str:
     if not timeframe:
         return "NONE"
@@ -383,6 +400,7 @@ def get_timeframe_bias(symbol: str, timeframe: str | None) -> str:
 
     return detect_trend_bias(signal_df)
 
+
 def get_multi_timeframe_bias(symbol: str, timeframe: str) -> tuple[str, str]:
     cfg = MULTI_TIMEFRAME_MAP.get(timeframe, {"confirm": None, "trend": None})
 
@@ -394,7 +412,13 @@ def get_multi_timeframe_bias(symbol: str, timeframe: str) -> tuple[str, str]:
 
     return confirm_bias, trend_bias
 
-def make_strategy_result(name: str, signal: str = "NONE", score: float = 0.0, reasons: list[str] | None = None) -> dict[str, Any]:
+
+def make_strategy_result(
+    name: str,
+    signal: str = "NONE",
+    score: float = 0.0,
+    reasons: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "name": name,
         "signal": signal,
@@ -549,7 +573,7 @@ def strategy_breakout(df: pd.DataFrame) -> dict[str, Any]:
 
 def strategy_heikin_ashi(df: pd.DataFrame) -> dict[str, Any]:
     if len(df) < 4:
-        return make_strategy_result("Heikin Ashi")
+        return make_strategy_result("Heikin Ashi Trend")
 
     last3 = df.tail(3)
 
@@ -609,37 +633,136 @@ def strategy_support_resistance(df: pd.DataFrame) -> dict[str, Any]:
     return make_strategy_result("Support/Resistance")
 
 
-def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def strategy_trend_continuation(df: pd.DataFrame) -> dict[str, Any]:
+    if len(df) < 4:
+        return make_strategy_result("Trend Continuation")
 
-    df["RSI"] = compute_rsi(df["Close"], RSI_PERIOD)
-    df["ATR"] = compute_atr(df, ATR_PERIOD)
-    df["EMA20"] = ema(df["Close"], 20)
-    df["EMA50"] = ema(df["Close"], 50)
+    last = df.iloc[-1]
+    prev1 = df.iloc[-2]
+    prev2 = df.iloc[-3]
 
-    macd_line, signal_line, macd_hist = compute_macd(df["Close"])
-    df["MACD"] = macd_line
-    df["MACD_SIGNAL"] = signal_line
-    df["MACD_HIST"] = macd_hist
+    close_price = float(last["Close"])
+    open_price = float(last["Open"])
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    atr = float(last["ATR"])
 
-    bb_lower, bb_mid, bb_upper = compute_bollinger(df["Close"], 20, 2.0)
-    df["BB_LOWER"] = bb_lower
-    df["BB_MID"] = bb_mid
-    df["BB_UPPER"] = bb_upper
+    prev1_body = abs(float(prev1["Close"]) - float(prev1["Open"]))
+    prev2_body = abs(float(prev2["Close"]) - float(prev2["Open"]))
 
-    ha = compute_heikin_ashi(df)
-    df["HA_Open"] = ha["HA_Open"]
-    df["HA_Close"] = ha["HA_Close"]
-    df["HA_High"] = ha["HA_High"]
-    df["HA_Low"] = ha["HA_Low"]
-    df["ATR_SLOW"] = df["ATR"].rolling(20).mean()
-    df["VOLATILITY_RATIO"] = (df["ATR"] / df["ATR_SLOW"]).replace([float("inf"), -float("inf")], 0)
-    df["EMA_GAP"] = (df["EMA20"] - df["EMA50"]).abs()
-    df["TREND_STRENGTH"] = (df["EMA_GAP"] / df["ATR"]).replace([float("inf"), -float("inf")], 0)
+    small_pause = prev1_body < atr * 0.5 and prev2_body < atr * 0.5
 
-    df.dropna(inplace=True)
-    return df
-    
+    if ema20 > ema50 and close_price > ema20 and close_price > open_price and small_pause:
+        return make_strategy_result(
+            "Trend Continuation",
+            "BUY",
+            16,
+            ["Тренд вверх сохраняется", "Была короткая пауза", "Движение вверх возобновилось"],
+        )
+
+    if ema20 < ema50 and close_price < ema20 and close_price < open_price and small_pause:
+        return make_strategy_result(
+            "Trend Continuation",
+            "SELL",
+            16,
+            ["Тренд вниз сохраняется", "Была короткая пауза", "Движение вниз возобновилось"],
+        )
+
+    return make_strategy_result("Trend Continuation")
+
+
+def strategy_rsi_divergence(df: pd.DataFrame) -> dict[str, Any]:
+    if len(df) < 8:
+        return make_strategy_result("RSI Divergence")
+
+    recent = df.iloc[-8:]
+
+    current_low = float(recent["Low"].iloc[-1])
+    previous_low = float(recent["Low"].iloc[:-1].min())
+
+    current_high = float(recent["High"].iloc[-1])
+    previous_high = float(recent["High"].iloc[:-1].max())
+
+    current_rsi = float(recent["RSI"].iloc[-1])
+    previous_rsi_min = float(recent["RSI"].iloc[:-1].min())
+    previous_rsi_max = float(recent["RSI"].iloc[:-1].max())
+
+    if current_low < previous_low and current_rsi > previous_rsi_min:
+        return make_strategy_result(
+            "RSI Divergence",
+            "BUY",
+            17,
+            ["Цена обновила локальный минимум", "RSI не подтвердил новый минимум", "Возможен разворот вверх"],
+        )
+
+    if current_high > previous_high and current_rsi < previous_rsi_max:
+        return make_strategy_result(
+            "RSI Divergence",
+            "SELL",
+            17,
+            ["Цена обновила локальный максимум", "RSI не подтвердил новый максимум", "Возможен разворот вниз"],
+        )
+
+    return make_strategy_result("RSI Divergence")
+
+
+def strategy_atr_expansion_breakout(df: pd.DataFrame) -> dict[str, Any]:
+    if len(df) < 25:
+        return make_strategy_result("ATR Expansion Breakout")
+
+    last = df.iloc[-1]
+    recent = df.iloc[-21:-1]
+
+    close_price = float(last["Close"])
+    open_price = float(last["Open"])
+    high_price = float(last["High"])
+    low_price = float(last["Low"])
+    atr = float(last["ATR"])
+    atr_slow = float(last["ATR_SLOW"]) if "ATR_SLOW" in df.columns else atr
+
+    recent_high = float(recent["High"].max())
+    recent_low = float(recent["Low"].min())
+
+    candle_range = max(high_price - low_price, 1e-10)
+    body = abs(close_price - open_price)
+    body_ratio = body / candle_range
+
+    close_position_from_low = (close_price - low_price) / candle_range
+    close_position_from_high = (high_price - close_price) / candle_range
+
+    if (
+        close_price > recent_high
+        and close_price > open_price
+        and atr_slow > 0
+        and atr / atr_slow >= 1.15
+        and body_ratio >= 0.6
+        and close_position_from_low >= 0.7
+    ):
+        return make_strategy_result(
+            "ATR Expansion Breakout",
+            "BUY",
+            19,
+            ["Пробой локального максимума", "Волатильность расширяется", "Свеча закрылась сильно вверх"],
+        )
+
+    if (
+        close_price < recent_low
+        and close_price < open_price
+        and atr_slow > 0
+        and atr / atr_slow >= 1.15
+        and body_ratio >= 0.6
+        and close_position_from_high >= 0.7
+    ):
+        return make_strategy_result(
+            "ATR Expansion Breakout",
+            "SELL",
+            19,
+            ["Пробой локального минимума", "Волатильность расширяется", "Свеча закрылась сильно вниз"],
+        )
+
+    return make_strategy_result("ATR Expansion Breakout")
+
+
 def get_candle_confirmation_bonus(df: pd.DataFrame) -> tuple[float, float]:
     if df is None or df.empty or len(df) < 2:
         return 0.0, 0.0
@@ -683,40 +806,8 @@ def get_candle_confirmation_bonus(df: pd.DataFrame) -> tuple[float, float]:
                 sell_bonus += 2.0
 
     return buy_bonus, sell_bonus
-    body_ratio = body / candle_range
 
-    upper_wick = high_price - max(open_price, close_price)
-    lower_wick = min(open_price, close_price) - low_price
 
-    buy_bonus = 0.0
-    sell_bonus = 0.0
-
-    # сильная бычья свеча
-    if close_price > open_price and body_ratio >= 0.55:
-        buy_bonus += 4.0
-
-    # сильная медвежья свеча
-    if close_price < open_price and body_ratio >= 0.55:
-        sell_bonus += 4.0
-
-    # длинная нижняя тень = возможный отскок вверх
-    if lower_wick > body * 1.2 and lower_wick > upper_wick:
-        buy_bonus += 2.0
-
-    # длинная верхняя тень = возможный отбой вниз
-    if upper_wick > body * 1.2 and upper_wick > lower_wick:
-        sell_bonus += 2.0
-
-    # дополнительный бонус, если свеча реально заметная относительно ATR
-    if atr > 0:
-        candle_vs_atr = candle_range / atr
-        if candle_vs_atr >= 0.8:
-            if close_price > open_price:
-                buy_bonus += 2.0
-            elif close_price < open_price:
-                sell_bonus += 2.0
-
-    return buy_bonus, sell_bonus
 def get_level_proximity_bonus(df: pd.DataFrame) -> tuple[float, float]:
     if df is None or df.empty or len(df) < 30:
         return 0.0, 0.0
@@ -724,7 +815,6 @@ def get_level_proximity_bonus(df: pd.DataFrame) -> tuple[float, float]:
     last = df.iloc[-1]
     recent = df.iloc[-25:-1]
 
-    price = float(last["Close"])
     low_price = float(last["Low"])
     high_price = float(last["High"])
     atr = float(last["ATR"]) if "ATR" in df.columns else 0.0
@@ -801,11 +891,13 @@ def get_expiry_delta(timeframe: str, duration_type: str) -> timedelta:
 
 def format_expiry_label(delta: timedelta) -> str:
     total_minutes = int(delta.total_seconds() // 60)
+
     if total_minutes < 60:
         return f"{total_minutes}m"
     if total_minutes < 1440:
         hours = total_minutes // 60
         return f"{hours}h"
+
     days = total_minutes // 1440
     return f"{days}d"
 
@@ -830,28 +922,35 @@ def combine_strategy_results(
         trend_strength = float(item.get("trend_strength", 1.0))
 
         if market_regime in ("UPTREND", "DOWNTREND"):
-            if name in ("EMA Pullback", "MACD Momentum"):
+            if name in ("EMA Pullback", "MACD Momentum", "Trend Continuation"):
                 score *= 1.18
             elif name == "Heikin Ashi Trend":
                 score *= 1.10
-            elif name in ("RSI Reversal", "Bollinger Reversal"):
+            elif name in ("RSI Reversal", "Bollinger Reversal", "RSI Divergence"):
                 score *= 0.94
 
         if market_regime in ("FLAT", "RANGE"):
-            if name in ("RSI Reversal", "Bollinger Reversal", "Support Bounce", "Resistance Bounce", "Support/Resistance"):
+            if name in (
+                "RSI Reversal",
+                "Bollinger Reversal",
+                "Support Bounce",
+                "Resistance Bounce",
+                "Support/Resistance",
+                "RSI Divergence",
+            ):
                 score *= 1.18
-            elif name in ("EMA Pullback", "MACD Momentum"):
+            elif name in ("EMA Pullback", "MACD Momentum", "Trend Continuation"):
                 score *= 0.94
-            elif name == "Breakout":
+            elif name in ("Breakout", "ATR Expansion Breakout"):
                 score *= 0.96
 
-        if name == "Breakout":
+        if name in ("Breakout", "ATR Expansion Breakout"):
             if volatility_ratio >= 1.15:
                 score *= 1.18
             elif volatility_ratio >= 1.05:
                 score *= 1.08
 
-        if name in ("EMA Pullback", "MACD Momentum", "Heikin Ashi Trend"):
+        if name in ("EMA Pullback", "MACD Momentum", "Heikin Ashi Trend", "Trend Continuation"):
             if trend_strength >= 1.8:
                 score *= 1.20
             elif trend_strength >= 1.2:
@@ -859,13 +958,13 @@ def combine_strategy_results(
             elif trend_strength <= 0.7:
                 score *= 0.92
 
-        if name in ("RSI Reversal", "Bollinger Reversal"):
+        if name in ("RSI Reversal", "Bollinger Reversal", "RSI Divergence"):
             if volatility_ratio >= 1.20:
                 score *= 0.90
             elif volatility_ratio <= 0.95:
                 score *= 1.06
 
-        if market_regime != "FLAT" and name == "Breakout":
+        if market_regime != "FLAT" and name in ("Breakout", "ATR Expansion Breakout"):
             score *= 1.08
 
         item["score"] = round(score, 2)
@@ -965,25 +1064,39 @@ def combine_strategy_results(
 
     return signal, confidence, quality_score, strategy_name, reason_text
 
-def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_type: str = DEFAULT_DURATION_TYPE) -> dict:
+
+def analyze_symbol(
+    symbol: str,
+    timeframe: str = DEFAULT_TIMEFRAME,
+    duration_type: str = DEFAULT_DURATION_TYPE,
+) -> dict:
     timeframe = normalize_timeframe(timeframe)
     duration_type = normalize_duration_type(duration_type)
 
     df = fetch_data(symbol, timeframe=timeframe)
-    MIN_BARS = 60
+    min_bars = 60
 
-    if df is None or df.empty or len(df) < MIN_BARS:
+    if df is None or df.empty or len(df) < min_bars:
         return empty_signal_payload(symbol, "Недостаточно данных", timeframe, duration_type)
 
     df = build_indicators(df)
 
     if df is None or df.empty or len(df) < 30:
-        return empty_signal_payload(symbol, "Недостаточно данных после расчёта индикаторов", timeframe, duration_type)
+        return empty_signal_payload(
+            symbol,
+            "Недостаточно данных после расчёта индикаторов",
+            timeframe,
+            duration_type,
+        )
 
-    # Используем закрытую свечу для расчёта сигнала, чтобы не было перерисовки
     signal_df = df.iloc[:-1].copy()
     if signal_df.empty or len(signal_df) < 30:
-        return empty_signal_payload(symbol, "Недостаточно закрытых свечей для анализа", timeframe, duration_type)
+        return empty_signal_payload(
+            symbol,
+            "Недостаточно закрытых свечей для анализа",
+            timeframe,
+            duration_type,
+        )
 
     last = signal_df.iloc[-1]
     market_candle = df.iloc[-1]
@@ -1008,6 +1121,9 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
         strategy_breakout(signal_df),
         strategy_heikin_ashi(signal_df),
         strategy_support_resistance(signal_df),
+        strategy_trend_continuation(signal_df),
+        strategy_rsi_divergence(signal_df),
+        strategy_atr_expansion_breakout(signal_df),
     ]
 
     for item in strategy_results:
@@ -1025,11 +1141,11 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
         level_sell_bonus,
     )
 
-    MIN_CONFIDENCE = 35.0
-    MIN_QUALITY = 28.0
+    min_confidence = 38.0
+    min_quality = 30.0
 
     if signal != "NONE":
-        if confidence < MIN_CONFIDENCE or quality_score < MIN_QUALITY:
+        if confidence < min_confidence or quality_score < min_quality:
             signal = "NONE"
             strategy_name = "Нет сигнала"
             reason = f"Сигнал слишком слабый: confidence={confidence}, quality={quality_score}"
@@ -1040,9 +1156,10 @@ def analyze_symbol(symbol: str, timeframe: str = DEFAULT_TIMEFRAME, duration_typ
                 signal = "NONE"
                 strategy_name = "Нет сигнала"
                 reason = (
-                    f"Конфликт таймфреймов: confirm={confirm_bias}, trend={trend_bias}, "
-                    f"confidence={confidence}"
+                    f"Конфликт таймфреймов: confirm={confirm_bias}, "
+                    f"trend={trend_bias}, confidence={confidence}"
                 )
+
     if signal == "NONE":
         entry_price = None
         tp = None
