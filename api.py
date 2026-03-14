@@ -304,11 +304,9 @@ def finalize_closed_signal(
         return item
 
     if exit_price is None:
-        item["result"] = "CLOSED"
-        item["exit_price"] = None
-        item["profit_value"] = None
-        item["profit_percent"] = None
-        return item
+    item["status"] = "closing"
+    item["result"] = "PENDING_CLOSE"
+    return item
 
     try:
         exit_price = float(exit_price)
