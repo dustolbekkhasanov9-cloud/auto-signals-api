@@ -7,3 +7,4 @@ openpyxl
 beautifulsoup4
 matplotlib
 numpy
+psycopg2-binary==2.9.9
