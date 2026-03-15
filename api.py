@@ -463,6 +463,56 @@ def update_closed_history_results() -> None:
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
     save_state_to_db()
 
+def update_waiting_history_results() -> None:
+    global signal_history
+
+    waiting_items_by_symbol: dict[str, list[dict]] = {}
+
+    for item in signal_history:
+        if item.get("result") != "WAITING_RESULT":
+            continue
+
+        symbol = item.get("symbol")
+        exit_time_iso = item.get("exit_time_iso")
+
+        if not symbol or not exit_time_iso:
+            continue
+
+        waiting_items_by_symbol.setdefault(symbol, []).append(item)
+
+    updated = False
+
+    for symbol, items in waiting_items_by_symbol.items():
+        exit_times_iso = [
+            item.get("exit_time_iso")
+            for item in items
+            if item.get("exit_time_iso")
+        ]
+
+        price_map = get_historical_exit_prices_bulk(symbol, exit_times_iso)
+
+        for idx, hist_item in enumerate(signal_history):
+            if hist_item.get("result") != "WAITING_RESULT":
+                continue
+            if hist_item.get("symbol") != symbol:
+                continue
+
+            exit_time_iso = hist_item.get("exit_time_iso", "")
+            exit_price = price_map.get(exit_time_iso)
+
+            if exit_price is None:
+                continue
+
+            signal_history[idx] = finalize_closed_signal(
+                hist_item,
+                exit_price=exit_price,
+                close_reason="waiting_result_resolved"
+            )
+            updated = True
+
+    if updated:
+        signal_history = signal_history[:MAX_HISTORY_ITEMS]
+        save_state_to_db()
 
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
     try:
@@ -539,6 +589,7 @@ async def refresh_all_signals() -> None:
             add_signals_to_active(all_results)
             deduplicate_active_signals()
             update_closed_history_results()
+            update_waiting_history_results()
 
             logger.info(
                 "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s, history=%s",
@@ -675,6 +726,7 @@ def get_signals(
 @app.get("/active_signals")
 def get_active_signals(limit: int = 150):
     update_closed_history_results()
+    update_waiting_history_results()
 
     now_utc = datetime.now(timezone.utc)
     fresh_items: list[dict] = []
@@ -729,6 +781,7 @@ async def manual_refresh():
 @app.get("/history")
 def get_history(limit: int = 150):
     update_closed_history_results()
+    update_waiting_history_results()
 
     history_items = [
         item for item in signal_history
