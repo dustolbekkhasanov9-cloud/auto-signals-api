@@ -266,9 +266,7 @@ def load_state_from_postgres() -> None:
         cur.close()
         conn.close()
 
-def make_signal_key_str(item: dict) -> str:
-    key = make_signal_key(item)
-    return "|".join("" if x is None else str(x) for x in key)
+def make_signal_key(item: dict) -> tuple:
     entry_time_iso = item.get("entry_time_iso", "") or ""
     exit_time_iso = item.get("exit_time_iso", "") or ""
 
@@ -300,6 +298,11 @@ def make_signal_key_str(item: dict) -> str:
         exit_time_iso,
         entry_price,
     )
+
+
+def make_signal_key_str(item: dict) -> str:
+    key = make_signal_key(item)
+    return "|".join("" if x is None else str(x) for x in key)
 
 
 def deduplicate_active_signals() -> None:
@@ -572,18 +575,18 @@ def update_closed_history_results() -> None:
                 signal_history.insert(0, closed_item)
 
     active_signals = still_active
-signal_history = signal_history[:MAX_HISTORY_ITEMS]
+    signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
-logger.info(
-    "HISTORY UPDATE: active=%s history=%s waiting=%s tp=%s sl=%s",
-    len(active_signals),
-    len(signal_history),
-    len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
-    len([x for x in signal_history if x.get("result") == "TP"]),
-    len([x for x in signal_history if x.get("result") == "SL"]),
-)
+    logger.info(
+        "HISTORY UPDATE: active=%s history=%s waiting=%s tp=%s sl=%s",
+        len(active_signals),
+        len(signal_history),
+        len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
+        len([x for x in signal_history if x.get("result") == "TP"]),
+        len([x for x in signal_history if x.get("result") == "SL"]),
+    )
 
-save_state_to_db()
+    save_state_to_db()
 
 
 def update_waiting_history_results() -> None:
