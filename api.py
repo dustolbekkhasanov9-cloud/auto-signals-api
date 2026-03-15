@@ -106,6 +106,7 @@ DEFAULT_TIMEFRAME = "1h"
 DEFAULT_DURATION_TYPE = "short"
 
 REFRESH_SECONDS = 60
+WAITING_RETRY_SECONDS = 600
 
 SCAN_TIMEFRAMES = ["5m", "10m", "30m", "1h"]
 SCAN_DURATION_TYPES = ["short", "long"]
@@ -437,6 +438,7 @@ def finalize_closed_signal(
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
+        item["last_fact_retry_iso"] = now_iso()
         return item
 
     try:
@@ -446,6 +448,7 @@ def finalize_closed_signal(
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
+        item["last_fact_retry_iso"] = now_iso()
         return item
 
     if exit_price is None:
@@ -453,8 +456,8 @@ def finalize_closed_signal(
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
+        item["last_fact_retry_iso"] = now_iso()
         return item
-
     try:
         exit_price = float(exit_price)
     except Exception:
@@ -462,6 +465,7 @@ def finalize_closed_signal(
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
+        item["last_fact_retry_iso"] = now_iso()
         return item
 
     item["exit_price"] = round(exit_price, 5)
@@ -645,6 +649,8 @@ def update_waiting_history_results() -> None:
     global signal_history
 
     waiting_items_by_symbol: dict[str, list[dict]] = {}
+    now_utc = datetime.now(timezone.utc)
+    updated = False
 
     for item in signal_history:
         if item.get("result") != "WAITING_RESULT":
@@ -656,9 +662,16 @@ def update_waiting_history_results() -> None:
         if not symbol or not exit_time_iso:
             continue
 
-        waiting_items_by_symbol.setdefault(symbol, []).append(item)
+        last_retry_iso = item.get("last_fact_retry_iso")
+        if last_retry_iso:
+            try:
+                last_retry_dt = parse_iso_utc(last_retry_iso)
+                if (now_utc - last_retry_dt).total_seconds() < WAITING_RETRY_SECONDS:
+                    continue
+            except Exception:
+                pass
 
-    updated = False
+        waiting_items_by_symbol.setdefault(symbol, []).append(item)
 
     for symbol, items in waiting_items_by_symbol.items():
         exit_times_iso = [
@@ -676,9 +689,14 @@ def update_waiting_history_results() -> None:
                 continue
 
             exit_time_iso = hist_item.get("exit_time_iso", "")
+            if exit_time_iso not in exit_times_iso:
+                continue
+
             exit_price = price_map.get(exit_time_iso)
 
             if exit_price is None:
+                signal_history[idx]["last_fact_retry_iso"] = now_iso()
+                updated = True
                 continue
 
             signal_history[idx] = finalize_closed_signal(
@@ -699,7 +717,7 @@ def update_waiting_history_results() -> None:
             len([x for x in signal_history if x.get("result") == "SL"]),
         )
 
-    save_state_to_db()
+        save_state_to_db()
     
 def apply_multitimeframe_confirmation(item: dict):
 
