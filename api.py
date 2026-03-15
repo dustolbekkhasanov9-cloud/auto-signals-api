@@ -283,13 +283,13 @@ def finalize_closed_signal(
     item = dict(item)
     item["closed_at_iso"] = now_iso()
     item["close_reason"] = close_reason or ""
-    item["status"] = "closed"
+    item["status"] = "history"
 
     entry_price = item.get("entry_price")
     signal = item.get("signal")
 
     if entry_price is None or signal not in ("BUY", "SELL"):
-        item["result"] = "CLOSED"
+        item["result"] = "WAITING_RESULT"
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
@@ -298,14 +298,14 @@ def finalize_closed_signal(
     try:
         entry_price = float(entry_price)
     except Exception:
-        item["result"] = "CLOSED"
+        item["result"] = "WAITING_RESULT"
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
         return item
 
     if exit_price is None:
-        item["result"] = "CLOSED"
+        item["result"] = "WAITING_RESULT"
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
@@ -314,7 +314,7 @@ def finalize_closed_signal(
     try:
         exit_price = float(exit_price)
     except Exception:
-        item["result"] = "CLOSED"
+        item["result"] = "WAITING_RESULT"
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
@@ -335,7 +335,6 @@ def finalize_closed_signal(
     item["profit_percent"] = round(profit_percent, 3)
 
     return item
-
 
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
@@ -384,8 +383,8 @@ def update_closed_history_results() -> None:
     expired_items_by_symbol: dict[str, list[dict]] = {}
 
     for item in active_signals:
-    if item.get("result") != "OPEN":
-        continue
+        if item.get("result") != "OPEN":
+            continue
 
         exit_time_iso = item.get("exit_time_iso", "")
 
@@ -731,14 +730,26 @@ async def manual_refresh():
 def get_history(limit: int = 150):
     update_closed_history_results()
 
-    closed_items = [
+    history_items = [
         item for item in signal_history
-        if item.get("result") in ("TP", "SL", "CLOSED")
+        if item.get("result") in ("WAITING_RESULT", "TP", "SL")
     ]
 
+    waiting_items = [
+        item for item in history_items
+        if item.get("result") == "WAITING_RESULT"
+    ]
+
+    final_items = [
+        item for item in history_items
+        if item.get("result") in ("TP", "SL")
+    ]
+
+    ordered_items = waiting_items + final_items
+
     return {
-        "items": closed_items[:limit],
-        "count": len(closed_items),
+        "items": ordered_items[:limit],
+        "count": len(ordered_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
     }
