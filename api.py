@@ -728,7 +728,7 @@ async def manual_refresh():
 
 
 @app.get("/history")
-def get_history(limit: int = 50):
+def get_history(limit: int = 150):
     update_closed_history_results()
 
     closed_items = [
