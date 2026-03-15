@@ -283,6 +283,7 @@ def finalize_closed_signal(
     item = dict(item)
     item["closed_at_iso"] = now_iso()
     item["close_reason"] = close_reason or ""
+    item["status"] = "closed"
 
     entry_price = item.get("entry_price")
     signal = item.get("signal")
@@ -304,9 +305,11 @@ def finalize_closed_signal(
         return item
 
     if exit_price is None:
-    item["status"] = "closing"
-    item["result"] = "PENDING_CLOSE"
-    return item
+        item["result"] = "CLOSED"
+        item["exit_price"] = None
+        item["profit_value"] = None
+        item["profit_percent"] = None
+        return item
 
     try:
         exit_price = float(exit_price)
@@ -381,9 +384,8 @@ def update_closed_history_results() -> None:
     expired_items_by_symbol: dict[str, list[dict]] = {}
 
     for item in active_signals:
-        if item.get("result") != "OPEN":
-            still_active.append(item)
-            continue
+    if item.get("result") != "OPEN":
+        continue
 
         exit_time_iso = item.get("exit_time_iso", "")
 
