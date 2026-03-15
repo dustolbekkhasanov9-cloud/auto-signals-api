@@ -11,13 +11,76 @@ from typing import Any, Dict
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
+import requests
 
 from signal_engine import analyze_symbol
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autosignal-api")
+
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+if not POLYGON_API_KEY:
+    logger.warning("POLYGON_API_KEY not set")
+
+def get_polygon_exit_price(symbol: str, exit_time_iso: str) -> float | None:
+    try:
+        if not POLYGON_API_KEY:
+            return None
+
+        pair = symbol.replace("=X", "")
+        ticker = f"C:{pair}"
+
+        dt = parse_iso_utc(exit_time_iso)
+        date_str = dt.strftime("%Y-%m-%d")
+
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{date_str}/{date_str}"
+
+        params = {
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": 5000,
+            "apiKey": POLYGON_API_KEY,
+        }
+
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            logger.warning("Polygon bad status for %s: %s", symbol, r.status_code)
+            return None
+
+        try:
+            data = r.json()
+        except Exception:
+            logger.warning("Polygon non-json response for %s", symbol)
+            return None
+
+        results = data.get("results", [])
+        if not results:
+            return None
+
+        # округляем время экспирации вниз до начала минуты
+        exit_minute_ts = int(dt.replace(second=0, microsecond=0).timestamp() * 1000)
+
+        # 1) пробуем найти свечу ровно на минуте экспирации
+        for candle in results:
+            ts = candle.get("t")
+            if ts == exit_minute_ts:
+                close_price = candle.get("c")
+                return float(close_price) if close_price is not None else None
+
+        # 2) если точной минуты нет — берём первую свечу ПОСЛЕ экспирации
+        for candle in results:
+            ts = candle.get("t")
+            if ts is not None and ts > exit_minute_ts:
+                close_price = candle.get("c")
+                return float(close_price) if close_price is not None else None
+
+        return None
+
+    except Exception as e:
+        logger.exception("Polygon exit price error %s %s", symbol, e)
+        return None
+
 
 DEFAULT_SYMBOLS = [
     "EURUSD=X",
@@ -318,80 +381,32 @@ def deduplicate_active_signals() -> None:
 
 
 def history_duplicate_exists(item: dict) -> bool:
-    symbol = item.get("symbol")
-    signal = item.get("signal")
-    timeframe = item.get("timeframe")
-    duration_type = item.get("duration_type")
-    entry_time_iso = item.get("entry_time_iso")
-    exit_time_iso = item.get("exit_time_iso")
+    try:
+        item_key = make_signal_key(item)
 
-    return any(
-        h.get("symbol") == symbol
-        and h.get("signal") == signal
-        and h.get("timeframe") == timeframe
-        and h.get("duration_type") == duration_type
-        and h.get("entry_time_iso") == entry_time_iso
-        and h.get("exit_time_iso") == exit_time_iso
-        for h in signal_history
-    )
+        for h in signal_history:
+            try:
+                if make_signal_key(h) == item_key:
+                    return True
+            except Exception:
+                continue
 
+        return False
+
+    except Exception:
+        return False
 
 def get_historical_exit_prices_bulk(
     symbol: str, exit_times_iso: list[str]
 ) -> dict[str, float | None]:
+
     result: dict[str, float | None] = {}
 
-    if not exit_times_iso:
-        return result
+    for exit_time_iso in exit_times_iso:
+        price = get_polygon_exit_price(symbol, exit_time_iso)
+        result[exit_time_iso] = price
 
-    try:
-        exit_dts = [parse_iso_utc(x) for x in exit_times_iso]
-        min_dt = min(exit_dts) - timedelta(minutes=10)
-        max_dt = max(exit_dts) + timedelta(minutes=2)
-
-        try:
-            df = yf.download(
-                symbol,
-                start=min_dt,
-                end=max_dt,
-                interval="1m",
-                progress=False,
-            )
-        except Exception as e:
-            logger.exception("Bulk historical price download error %s %s", symbol, e)
-            return {x: None for x in exit_times_iso}
-
-        if df is None or len(df) == 0:
-            return {x: None for x in exit_times_iso}
-
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        else:
-            df.index = df.index.tz_convert("UTC")
-
-        for exit_time_iso in exit_times_iso:
-            exit_dt = parse_iso_utc(exit_time_iso)
-            eligible = df[df.index <= exit_dt]
-
-            if eligible.empty:
-                result[exit_time_iso] = None
-                continue
-
-            close_value = eligible.iloc[-1]["Close"]
-            if hasattr(close_value, "item"):
-                close_value = close_value.item()
-
-            result[exit_time_iso] = float(close_value)
-
-        return result
-
-    except Exception as e:
-        logger.exception("Bulk historical price error %s %s", symbol, e)
-        return {x: None for x in exit_times_iso}
-
-    except Exception as e:
-        logger.exception("Bulk historical price error %s %s", symbol, e)
-        return {x: None for x in exit_times_iso}
+    return result
 
 
 def finalize_closed_signal(
@@ -458,10 +473,31 @@ def finalize_closed_signal(
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
+    stats = calculate_strategy_stats()
+
     existing_keys = {make_signal_key(s) for s in active_signals}
     state_changed = False
 
     for item in items:
+        item = apply_market_regime_bonus(item)
+        item = apply_multitimeframe_confirmation(item)
+        item = apply_volatility_filter(item)
+
+        strategy = item.get("strategy")
+        if strategy in stats:
+            winrate = stats[strategy]
+            item["confidence"] = round(
+                item.get("confidence", 50) * (0.5 + winrate),
+                1
+            )
+
+        try:
+            confidence_value = float(item.get("confidence", 50) or 50)
+        except Exception:
+            confidence_value = 50.0
+
+        item["confidence"] = round(max(1.0, min(100.0, confidence_value)), 1)
+
         signal = item.get("signal")
         entry_time_iso = item.get("entry_time_iso")
 
@@ -487,6 +523,7 @@ def add_signals_to_active(items: list[dict]) -> None:
                 "result": "OPEN",
             }
         )
+
         existing_keys.add(key)
         state_changed = True
 
@@ -529,7 +566,8 @@ def update_closed_history_results() -> None:
                 signal_history.insert(0, closed_item)
             continue
 
-        if exit_dt > now_utc:
+        # допускаем 2 секунды погрешности
+        if (exit_dt - now_utc).total_seconds() > 2:
             still_active.append(item)
             continue
 
@@ -652,6 +690,112 @@ def update_waiting_history_results() -> None:
         )
 
     save_state_to_db()
+    
+def apply_multitimeframe_confirmation(item: dict):
+
+    confirm_bias = item.get("confirm_bias")
+    trend_bias = item.get("trend_bias")
+    signal = item.get("signal")
+
+    confidence = item.get("confidence", 50)
+
+    if signal == confirm_bias == trend_bias:
+        confidence *= 1.25
+
+    elif signal == confirm_bias:
+        confidence *= 1.1
+
+    else:
+        confidence *= 0.85
+
+    item["confidence"] = round(confidence, 1)
+
+    return item
+    
+def apply_volatility_filter(item: dict):
+
+    volatility = item.get("volatility_ratio")
+
+    if volatility is None:
+        return item
+
+    confidence = item.get("confidence", 50)
+
+    # рынок слишком тихий
+    if volatility < 0.7:
+        confidence *= 0.7
+
+    # идеальная зона
+    elif 0.8 <= volatility <= 1.2:
+        confidence *= 1.15
+
+    # слишком волатильный
+    elif volatility > 1.5:
+        confidence *= 0.85
+
+    item["confidence"] = round(confidence, 1)
+
+    return item
+    
+def apply_market_regime_bonus(item: dict):
+
+    regime = item.get("market_regime")
+    strategy = item.get("strategy")
+
+    confidence = item.get("confidence", 50)
+
+    if regime == "TREND" and "trend" in str(strategy).lower():
+        confidence *= 1.2
+
+    elif regime == "RANGE" and "rsi" in str(strategy).lower():
+        confidence *= 1.2
+
+    elif regime == "VOLATILE" and "breakout" in str(strategy).lower():
+        confidence *= 1.2
+
+    else:
+        confidence *= 0.9
+
+    item["confidence"] = round(confidence, 1)
+
+    return item
+    
+def calculate_strategy_stats():
+
+    stats = {}
+
+    for item in signal_history:
+
+        strategy = item.get("strategy")
+
+        if not strategy:
+            continue
+
+        result = item.get("result")
+
+        if result not in ("TP", "SL"):
+            continue
+
+        if strategy not in stats:
+            stats[strategy] = {"tp": 0, "sl": 0}
+
+        if result == "TP":
+            stats[strategy]["tp"] += 1
+        else:
+            stats[strategy]["sl"] += 1
+
+    winrate = {}
+
+    for strategy, data in stats.items():
+
+        total = data["tp"] + data["sl"]
+
+        if total == 0:
+            continue
+
+        winrate[strategy] = data["tp"] / total
+
+    return winrate
     
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
     try:
