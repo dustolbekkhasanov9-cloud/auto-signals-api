@@ -769,25 +769,25 @@ async def lifespan(app: FastAPI):
     init_db()
 
     if postgres_ready:
-    try:
-        load_state_from_postgres()
-
-        if len(active_signals) == 0 and len(signal_history) == 0:
-            logger.info("POSTGRES EMPTY, LOADING SQLITE BACKUP")
-            load_state_from_db()
-            save_state_to_postgres()
-        else:
-            logger.info("STATE LOADED FROM POSTGRES")
-
-    except Exception as e:
-        logger.exception("POSTGRES LOAD FAILED, FALLBACK SQLITE: %s", e)
-        load_state_from_db()
         try:
-            save_state_to_postgres()
-        except Exception as pg_e:
-            logger.exception("POSTGRES BACKFILL FAILED: %s", pg_e)
-else:
-    load_state_from_db()
+            load_state_from_postgres()
+
+            if len(active_signals) == 0 and len(signal_history) == 0:
+                logger.info("POSTGRES EMPTY, LOADING SQLITE BACKUP")
+                load_state_from_db()
+                save_state_to_postgres()
+            else:
+                logger.info("STATE LOADED FROM POSTGRES")
+
+        except Exception as e:
+            logger.exception("POSTGRES LOAD FAILED, FALLBACK SQLITE: %s", e)
+            load_state_from_db()
+            try:
+                save_state_to_postgres()
+            except Exception as pg_e:
+                logger.exception("POSTGRES BACKFILL FAILED: %s", pg_e)
+    else:
+        load_state_from_db()
 
     deduplicate_active_signals()
     update_closed_history_results()
