@@ -349,22 +349,19 @@ def get_historical_exit_prices_bulk(
         min_dt = min(exit_dts) - timedelta(minutes=10)
         max_dt = max(exit_dts) + timedelta(minutes=2)
 
-    try:
-        df = yf.download(
-            symbol,
-            start=min_dt,
-            end=max_dt,
-            interval="1m",
-            progress=False,
-        )
-    except Exception:
-        return {x: None for x in exit_times_iso}
+        try:
+            df = yf.download(
+                symbol,
+                start=min_dt,
+                end=max_dt,
+                interval="1m",
+                progress=False,
+            )
+        except Exception as e:
+            logger.exception("Bulk historical price download error %s %s", symbol, e)
+            return {x: None for x in exit_times_iso}
 
-if df is None or len(df) == 0:
-    return {x: None for x in exit_times_iso}
-    
-
-        if df is None or df.empty:
+        if df is None or len(df) == 0:
             return {x: None for x in exit_times_iso}
 
         if df.index.tz is None:
@@ -387,6 +384,10 @@ if df is None or len(df) == 0:
             result[exit_time_iso] = float(close_value)
 
         return result
+
+    except Exception as e:
+        logger.exception("Bulk historical price error %s %s", symbol, e)
+        return {x: None for x in exit_times_iso}
 
     except Exception as e:
         logger.exception("Bulk historical price error %s %s", symbol, e)
