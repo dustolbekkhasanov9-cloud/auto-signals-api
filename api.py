@@ -754,18 +754,27 @@ async def background_refresh_loop() -> None:
 
         await asyncio.sleep(REFRESH_SECONDS)
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_postgres()
+    postgres_ready = False
+
+    try:
+        init_postgres()
+        postgres_ready = True
+        logger.info("POSTGRES INIT OK")
+    except Exception as e:
+        logger.exception("POSTGRES INIT FAILED, FALLBACK SQLITE: %s", e)
 
     init_db()
 
-    try:
-        load_state_from_postgres()
-        logger.info("STATE LOADED FROM POSTGRES")
-    except Exception as e:
-        logger.exception("POSTGRES LOAD FAILED, FALLBACK SQLITE: %s", e)
+    if postgres_ready:
+        try:
+            load_state_from_postgres()
+            logger.info("STATE LOADED FROM POSTGRES")
+        except Exception as e:
+            logger.exception("POSTGRES LOAD FAILED, FALLBACK SQLITE: %s", e)
+            load_state_from_db()
+    else:
         load_state_from_db()
 
     deduplicate_active_signals()
