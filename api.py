@@ -164,6 +164,50 @@ def save_state_to_db() -> None:
         finally:
             conn.close()
 
+    try:
+        save_state_to_postgres()
+    except Exception as e:
+        logger.exception("Postgres save failed: %s", e)
+
+
+def save_state_to_postgres() -> None:
+    global active_signals, signal_history
+
+    conn = get_pg_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("DELETE FROM active_signals_pg;")
+        cur.execute("DELETE FROM signal_history_pg;")
+
+        for item in active_signals:
+            signal_key = make_signal_key_str(item)
+            cur.execute(
+                """
+                INSERT INTO active_signals_pg (signal_key, payload, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (signal_key)
+                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+                """,
+                (signal_key, json.dumps(item, ensure_ascii=False)),
+            )
+
+        for item in signal_history:
+            signal_key = make_signal_key_str(item)
+            cur.execute(
+                """
+                INSERT INTO signal_history_pg (signal_key, payload, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (signal_key)
+                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+                """,
+                (signal_key, json.dumps(item, ensure_ascii=False)),
+            )
+
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 def load_state_from_db() -> None:
     global active_signals, signal_history
@@ -195,8 +239,36 @@ def load_state_from_db() -> None:
         finally:
             conn.close()
 
+def load_state_from_postgres() -> None:
+    global active_signals, signal_history
 
-def make_signal_key(item: dict) -> tuple:
+    conn = get_pg_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT payload FROM active_signals_pg ORDER BY id ASC;")
+        active_rows = cur.fetchall()
+
+        cur.execute("SELECT payload FROM signal_history_pg ORDER BY id DESC;")
+        history_rows = cur.fetchall()
+
+        active_signals = [row["payload"] for row in active_rows] if active_rows else []
+        signal_history = [row["payload"] for row in history_rows] if history_rows else []
+
+        if not isinstance(active_signals, list):
+            active_signals = []
+
+        if not isinstance(signal_history, list):
+            signal_history = []
+
+        signal_history = signal_history[:MAX_HISTORY_ITEMS]
+    finally:
+        cur.close()
+        conn.close()
+
+def make_signal_key_str(item: dict) -> str:
+    key = make_signal_key(item)
+    return "|".join("" if x is None else str(x) for x in key)
     entry_time_iso = item.get("entry_time_iso", "") or ""
     exit_time_iso = item.get("exit_time_iso", "") or ""
 
@@ -681,7 +753,14 @@ async def lifespan(app: FastAPI):
     init_postgres()
 
     init_db()
-    load_state_from_db()
+
+    try:
+        load_state_from_postgres()
+        logger.info("STATE LOADED FROM POSTGRES")
+    except Exception as e:
+        logger.exception("POSTGRES LOAD FAILED, FALLBACK SQLITE: %s", e)
+        load_state_from_db()
+
     deduplicate_active_signals()
     update_closed_history_results()
     update_waiting_history_results()
@@ -877,6 +956,17 @@ def get_history(limit: int = 150):
     }
 
 
+@app.get("/debug/storage")
+def debug_storage():
+    return {
+        "active_signals_count": len(active_signals),
+        "history_count": len(signal_history),
+        "history_waiting_count": len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
+        "history_tp_count": len([x for x in signal_history if x.get("result") == "TP"]),
+        "history_sl_count": len([x for x in signal_history if x.get("result") == "SL"]),
+        "database_url_set": bool(DATABASE_URL),
+    }
+    
 @app.get("/feed")
 def get_feed():
     return build_feed()
