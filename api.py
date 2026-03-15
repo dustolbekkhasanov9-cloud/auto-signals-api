@@ -9,6 +9,8 @@ import sqlite3
 import threading
 from typing import Any, Dict
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 
@@ -50,6 +52,7 @@ MAX_HISTORY_ITEMS = 300
 
 DB_PATH = os.environ.get("KIKI_DB_PATH", "kiki_state.db")
 db_lock = threading.Lock()
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 def parse_iso_utc(value: str) -> datetime:
@@ -78,6 +81,43 @@ def get_db_connection() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+def get_pg_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor
+    )
+
+
+def init_postgres() -> None:
+    conn = get_pg_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS active_signals_pg (
+            id SERIAL PRIMARY KEY,
+            signal_key TEXT UNIQUE NOT NULL,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_history_pg (
+            id SERIAL PRIMARY KEY,
+            signal_key TEXT UNIQUE NOT NULL,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def init_db() -> None:
     with db_lock:
@@ -460,8 +500,9 @@ def update_closed_history_results() -> None:
                 signal_history.insert(0, closed_item)
 
     active_signals = still_active
-    signal_history = signal_history[:MAX_HISTORY_ITEMS]
-    logger.info(
+signal_history = signal_history[:MAX_HISTORY_ITEMS]
+
+logger.info(
     "HISTORY UPDATE: active=%s history=%s waiting=%s tp=%s sl=%s",
     len(active_signals),
     len(signal_history),
@@ -469,7 +510,8 @@ def update_closed_history_results() -> None:
     len([x for x in signal_history if x.get("result") == "TP"]),
     len([x for x in signal_history if x.get("result") == "SL"]),
 )
-    save_state_to_db()
+
+save_state_to_db()
 
 
 def update_waiting_history_results() -> None:
@@ -636,6 +678,8 @@ async def background_refresh_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_postgres()
+
     init_db()
     load_state_from_db()
     deduplicate_active_signals()
