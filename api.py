@@ -461,7 +461,16 @@ def update_closed_history_results() -> None:
 
     active_signals = still_active
     signal_history = signal_history[:MAX_HISTORY_ITEMS]
+    logger.info(
+    "HISTORY UPDATE: active=%s history=%s waiting=%s tp=%s sl=%s",
+    len(active_signals),
+    len(signal_history),
+    len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
+    len([x for x in signal_history if x.get("result") == "TP"]),
+    len([x for x in signal_history if x.get("result") == "SL"]),
+)
     save_state_to_db()
+
 
 def update_waiting_history_results() -> None:
     global signal_history
@@ -512,8 +521,16 @@ def update_waiting_history_results() -> None:
 
     if updated:
         signal_history = signal_history[:MAX_HISTORY_ITEMS]
-        save_state_to_db()
 
+        logger.info(
+            "WAITING RESOLVE: history=%s waiting=%s tp=%s sl=%s",
+            len(signal_history),
+            len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
+            len([x for x in signal_history if x.get("result") == "TP"]),
+            len([x for x in signal_history if x.get("result") == "SL"]),
+        )
+
+    save_state_to_db()
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
     try:
         result = await asyncio.to_thread(
@@ -623,6 +640,7 @@ async def lifespan(app: FastAPI):
     load_state_from_db()
     deduplicate_active_signals()
     update_closed_history_results()
+    update_waiting_history_results()
     save_state_to_db()
 
     try:
@@ -664,12 +682,19 @@ def root():
 
 @app.get("/health")
 def health():
+    waiting_count = len([x for x in signal_history if x.get("result") == "WAITING_RESULT"])
+    tp_count = len([x for x in signal_history if x.get("result") == "TP"])
+    sl_count = len([x for x in signal_history if x.get("result") == "SL"])
+
     return {
         "status": "ok",
         "cache_ready": len(signal_cache) > 0,
         "scan_cache_ready": len(scan_cache) > 0,
         "active_signals_count": len(active_signals),
         "history_count": len(signal_history),
+        "history_waiting_count": waiting_count,
+        "history_tp_count": tp_count,
+        "history_sl_count": sl_count,
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
     }
