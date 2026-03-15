@@ -177,8 +177,8 @@ def save_state_to_postgres() -> None:
     cur = conn.cursor()
 
     try:
-        cur.execute("DELETE FROM active_signals_pg;")
-        cur.execute("DELETE FROM signal_history_pg;")
+        cur.execute("TRUNCATE TABLE active_signals_pg RESTART IDENTITY;")
+        cur.execute("TRUNCATE TABLE signal_history_pg RESTART IDENTITY;")
 
         for item in active_signals:
             signal_key = make_signal_key_str(item)
@@ -186,8 +186,6 @@ def save_state_to_postgres() -> None:
                 """
                 INSERT INTO active_signals_pg (signal_key, payload, updated_at)
                 VALUES (%s, %s::jsonb, NOW())
-                ON CONFLICT (signal_key)
-                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
                 """,
                 (signal_key, json.dumps(item, ensure_ascii=False)),
             )
@@ -198,8 +196,6 @@ def save_state_to_postgres() -> None:
                 """
                 INSERT INTO signal_history_pg (signal_key, payload, updated_at)
                 VALUES (%s, %s::jsonb, NOW())
-                ON CONFLICT (signal_key)
-                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
                 """,
                 (signal_key, json.dumps(item, ensure_ascii=False)),
             )
@@ -648,6 +644,7 @@ def update_waiting_history_results() -> None:
         )
 
     save_state_to_db()
+    
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
     try:
         result = await asyncio.to_thread(
@@ -973,3 +970,4 @@ def debug_storage():
 @app.get("/feed")
 def get_feed():
     return build_feed()
+
