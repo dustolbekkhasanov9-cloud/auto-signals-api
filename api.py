@@ -28,6 +28,10 @@ def get_polygon_exit_price(symbol: str, exit_time_iso: str) -> float | None:
         if not POLYGON_API_KEY:
             return None
 
+        cache_key = f"{symbol}:{exit_time_iso}"
+        if cache_key in polygon_price_cache:
+            return polygon_price_cache[cache_key]
+
         pair = symbol.replace("=X", "")
         ticker = f"C:{pair}"
 
@@ -46,35 +50,40 @@ def get_polygon_exit_price(symbol: str, exit_time_iso: str) -> float | None:
         r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
             logger.warning("Polygon bad status for %s: %s", symbol, r.status_code)
+            polygon_price_cache[cache_key] = None
             return None
 
         try:
             data = r.json()
         except Exception:
             logger.warning("Polygon non-json response for %s", symbol)
+            polygon_price_cache[cache_key] = None
             return None
 
         results = data.get("results", [])
         if not results:
+            polygon_price_cache[cache_key] = None
             return None
 
-        # округляем время экспирации вниз до начала минуты
         exit_minute_ts = int(dt.replace(second=0, microsecond=0).timestamp() * 1000)
 
-        # 1) пробуем найти свечу ровно на минуте экспирации
         for candle in results:
             ts = candle.get("t")
             if ts == exit_minute_ts:
                 close_price = candle.get("c")
-                return float(close_price) if close_price is not None else None
+                value = float(close_price) if close_price is not None else None
+                polygon_price_cache[cache_key] = value
+                return value
 
-        # 2) если точной минуты нет — берём первую свечу ПОСЛЕ экспирации
         for candle in results:
             ts = candle.get("t")
             if ts is not None and ts > exit_minute_ts:
                 close_price = candle.get("c")
-                return float(close_price) if close_price is not None else None
+                value = float(close_price) if close_price is not None else None
+                polygon_price_cache[cache_key] = value
+                return value
 
+        polygon_price_cache[cache_key] = None
         return None
 
     except Exception as e:
@@ -96,7 +105,7 @@ DEFAULT_SYMBOLS = [
 DEFAULT_TIMEFRAME = "1h"
 DEFAULT_DURATION_TYPE = "short"
 
-REFRESH_SECONDS = 30
+REFRESH_SECONDS = 60
 
 SCAN_TIMEFRAMES = ["5m", "10m", "30m", "1h"]
 SCAN_DURATION_TYPES = ["short", "long"]
@@ -105,6 +114,7 @@ signal_cache: Dict[str, Dict[str, Any]] = {}
 scan_cache: Dict[str, Dict[str, Any]] = {}
 last_updated_at: str | None = None
 last_refresh_status: str = "starting"
+polygon_price_cache: dict[str, float | None] = {}
 
 active_signals: list[dict] = []
 signal_history: list[dict] = []
