@@ -2,94 +2,16 @@ from news_feed import build_feed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 import asyncio
-import json
 import logging
-import os
-import sqlite3
-import threading
-from typing import Any, Dict
+from typing import Dict, Any
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Query
-import requests
-
+from fastapi import FastAPI, Query, HTTPException
 from signal_engine import analyze_symbol
+import pandas as pd
+import yfinance as yf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autosignal-api")
-
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
-if not POLYGON_API_KEY:
-    logger.warning("POLYGON_API_KEY not set")
-
-def get_polygon_exit_price(symbol: str, exit_time_iso: str) -> float | None:
-    try:
-        if not POLYGON_API_KEY:
-            return None
-
-        cache_key = f"{symbol}:{exit_time_iso}"
-        if cache_key in polygon_price_cache:
-            return polygon_price_cache[cache_key]
-
-        pair = symbol.replace("=X", "")
-        ticker = f"C:{pair}"
-
-        dt = parse_iso_utc(exit_time_iso)
-        date_str = dt.strftime("%Y-%m-%d")
-
-        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{date_str}/{date_str}"
-
-        params = {
-            "adjusted": "true",
-            "sort": "asc",
-            "limit": 5000,
-            "apiKey": POLYGON_API_KEY,
-        }
-
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            logger.warning("Polygon bad status for %s: %s", symbol, r.status_code)
-            polygon_price_cache[cache_key] = None
-            return None
-
-        try:
-            data = r.json()
-        except Exception:
-            logger.warning("Polygon non-json response for %s", symbol)
-            polygon_price_cache[cache_key] = None
-            return None
-
-        results = data.get("results", [])
-        if not results:
-            polygon_price_cache[cache_key] = None
-            return None
-
-        exit_minute_ts = int(dt.replace(second=0, microsecond=0).timestamp() * 1000)
-
-        for candle in results:
-            ts = candle.get("t")
-            if ts == exit_minute_ts:
-                close_price = candle.get("c")
-                value = float(close_price) if close_price is not None else None
-                polygon_price_cache[cache_key] = value
-                return value
-
-        for candle in results:
-            ts = candle.get("t")
-            if ts is not None and ts > exit_minute_ts:
-                close_price = candle.get("c")
-                value = float(close_price) if close_price is not None else None
-                polygon_price_cache[cache_key] = value
-                return value
-
-        polygon_price_cache[cache_key] = None
-        return None
-
-    except Exception as e:
-        logger.exception("Polygon exit price error %s %s", symbol, e)
-        return None
-
 
 DEFAULT_SYMBOLS = [
     "EURUSD=X",
@@ -105,8 +27,7 @@ DEFAULT_SYMBOLS = [
 DEFAULT_TIMEFRAME = "1h"
 DEFAULT_DURATION_TYPE = "short"
 
-REFRESH_SECONDS = 60
-WAITING_RETRY_SECONDS = 600
+REFRESH_SECONDS = 30
 
 SCAN_TIMEFRAMES = ["5m", "10m", "30m", "1h"]
 SCAN_DURATION_TYPES = ["short", "long"]
@@ -115,18 +36,11 @@ signal_cache: Dict[str, Dict[str, Any]] = {}
 scan_cache: Dict[str, Dict[str, Any]] = {}
 last_updated_at: str | None = None
 last_refresh_status: str = "starting"
-polygon_price_cache: dict[str, float | None] = {}
 
 active_signals: list[dict] = []
 signal_history: list[dict] = []
 
-refresh_lock = asyncio.Lock()
-
 MAX_HISTORY_ITEMS = 300
-
-DB_PATH = os.environ.get("KIKI_DB_PATH", "kiki_state.db")
-db_lock = threading.Lock()
-DATABASE_URL = os.environ.get("DATABASE_URL")
 
 
 def parse_iso_utc(value: str) -> datetime:
@@ -135,6 +49,92 @@ def parse_iso_utc(value: str) -> datetime:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def get_historical_exit_prices_bulk(symbol: str, exit_times_iso: list[str]) -> dict[str, float | None]:
+    result: dict[str, float | None] = {}
+
+    if not exit_times_iso:
+        return result
+
+    try:
+        exit_dts = [parse_iso_utc(x) for x in exit_times_iso]
+        min_dt = min(exit_dts) - timedelta(minutes=10)
+        max_dt = max(exit_dts) + timedelta(minutes=2)
+
+        df = yf.download(
+            symbol,
+            start=min_dt,
+            end=max_dt,
+            interval="1m",
+            progress=False,
+        )
+
+        if df is None or df.empty:
+            return {x: None for x in exit_times_iso}
+
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        for exit_time_iso in exit_times_iso:
+            exit_dt = parse_iso_utc(exit_time_iso)
+            eligible = df[df.index <= exit_dt]
+
+            if eligible.empty:
+                result[exit_time_iso] = None
+                continue
+
+            close_value = eligible.iloc[-1]["Close"]
+            if hasattr(close_value, "item"):
+                close_value = close_value.item()
+
+            result[exit_time_iso] = float(close_value)
+
+        return result
+
+    except Exception as e:
+        logger.exception("Bulk historical price error %s %s", symbol, e)
+        return {x: None for x in exit_times_iso}
+
+def get_historical_exit_price(symbol: str, exit_time_iso: str) -> float | None:
+    try:
+        exit_dt = parse_iso_utc(exit_time_iso)
+
+        start_dt = exit_dt - timedelta(minutes=10)
+        end_dt = exit_dt + timedelta(minutes=2)
+
+        df = yf.download(
+            symbol,
+            start=start_dt,
+            end=end_dt,
+            interval="1m",
+            progress=False,
+        )
+
+        if df is None or df.empty:
+            return None
+
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        eligible = df[df.index <= exit_dt]
+
+        if eligible.empty:
+            return None
+
+        close_value = eligible.iloc[-1]["Close"]
+
+        if hasattr(close_value, "item"):
+            close_value = close_value.item()
+
+        return float(close_value)
+
+    except Exception as e:
+        logger.exception("Historical price error %s %s", symbol, e)
+        return None
 
 
 def make_cache_key(symbol: str, timeframe: str, duration_type: str) -> str:
@@ -150,370 +150,43 @@ def make_error_payload(symbol: str, reason: str) -> dict:
     }
 
 
-def get_db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def get_pg_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-
-    return psycopg2.connect(
-        DATABASE_URL,
-        cursor_factory=RealDictCursor
-    )
-
-
-def init_postgres() -> None:
-    conn = get_pg_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS active_signals_pg (
-            id SERIAL PRIMARY KEY,
-            signal_key TEXT UNIQUE NOT NULL,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS signal_history_pg (
-            id SERIAL PRIMARY KEY,
-            signal_key TEXT UNIQUE NOT NULL,
-            payload JSONB NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def init_db() -> None:
-    with db_lock:
-        conn = get_db_connection()
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS app_state (
-                    state_key TEXT PRIMARY KEY,
-                    state_value TEXT NOT NULL
-                )
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def save_state_to_db() -> None:
-    global active_signals, signal_history
-
-    with db_lock:
-        conn = get_db_connection()
-        try:
-            conn.execute(
-                """
-                INSERT INTO app_state (state_key, state_value)
-                VALUES (?, ?)
-                ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value
-                """,
-                ("active_signals", json.dumps(active_signals, ensure_ascii=False)),
-            )
-
-            conn.execute(
-                """
-                INSERT INTO app_state (state_key, state_value)
-                VALUES (?, ?)
-                ON CONFLICT(state_key) DO UPDATE SET state_value=excluded.state_value
-                """,
-                ("signal_history", json.dumps(signal_history, ensure_ascii=False)),
-            )
-
-            conn.commit()
-        finally:
-            conn.close()
-
-    try:
-        save_state_to_postgres()
-    except Exception as e:
-        logger.exception("Postgres save failed: %s", e)
-
-
-def save_state_to_postgres() -> None:
-    global active_signals, signal_history
-
-    conn = get_pg_connection()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("TRUNCATE TABLE active_signals_pg RESTART IDENTITY;")
-        cur.execute("TRUNCATE TABLE signal_history_pg RESTART IDENTITY;")
-
-        for item in active_signals:
-            signal_key = make_signal_key_str(item)
-            cur.execute(
-                """
-                INSERT INTO active_signals_pg (signal_key, payload, updated_at)
-                VALUES (%s, %s::jsonb, NOW())
-                """,
-                (signal_key, json.dumps(item, ensure_ascii=False)),
-            )
-
-        for item in signal_history:
-            signal_key = make_signal_key_str(item)
-            cur.execute(
-                """
-                INSERT INTO signal_history_pg (signal_key, payload, updated_at)
-                VALUES (%s, %s::jsonb, NOW())
-                """,
-                (signal_key, json.dumps(item, ensure_ascii=False)),
-            )
-
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-
-def load_state_from_db() -> None:
-    global active_signals, signal_history
-
-    with db_lock:
-        conn = get_db_connection()
-        try:
-            rows = conn.execute(
-                "SELECT state_key, state_value FROM app_state"
-            ).fetchall()
-
-            loaded: dict[str, str] = {
-                row["state_key"]: row["state_value"] for row in rows
-            }
-
-            active_raw = loaded.get("active_signals")
-            history_raw = loaded.get("signal_history")
-
-            active_signals = json.loads(active_raw) if active_raw else []
-            signal_history = json.loads(history_raw) if history_raw else []
-
-            if not isinstance(active_signals, list):
-                active_signals = []
-
-            if not isinstance(signal_history, list):
-                signal_history = []
-
-            signal_history = signal_history[:MAX_HISTORY_ITEMS]
-        finally:
-            conn.close()
-
-def load_state_from_postgres() -> None:
-    global active_signals, signal_history
-
-    conn = get_pg_connection()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("SELECT payload FROM active_signals_pg ORDER BY id ASC;")
-        active_rows = cur.fetchall()
-
-        cur.execute("SELECT payload FROM signal_history_pg ORDER BY id DESC;")
-        history_rows = cur.fetchall()
-
-        active_signals = [row["payload"] for row in active_rows] if active_rows else []
-        signal_history = [row["payload"] for row in history_rows] if history_rows else []
-
-        if not isinstance(active_signals, list):
-            active_signals = []
-
-        if not isinstance(signal_history, list):
-            signal_history = []
-
-        signal_history = signal_history[:MAX_HISTORY_ITEMS]
-    finally:
-        cur.close()
-        conn.close()
-
-def make_signal_key(item: dict) -> tuple:
-    entry_time_iso = item.get("entry_time_iso", "") or ""
-    exit_time_iso = item.get("exit_time_iso", "") or ""
-
-    if entry_time_iso:
-        try:
-            entry_time_iso = parse_iso_utc(entry_time_iso).strftime("%Y-%m-%dT%H:%M")
-        except Exception:
-            entry_time_iso = str(entry_time_iso)[:16]
-
-    if exit_time_iso:
-        try:
-            exit_time_iso = parse_iso_utc(exit_time_iso).strftime("%Y-%m-%dT%H:%M")
-        except Exception:
-            exit_time_iso = str(exit_time_iso)[:16]
-
-    entry_price = item.get("entry_price")
-    if entry_price is not None:
-        try:
-            entry_price = round(float(entry_price), 5)
-        except Exception:
-            entry_price = None
-
-    return (
-        item.get("symbol"),
-        item.get("signal"),
-        item.get("timeframe"),
-        item.get("duration_type"),
-        entry_time_iso,
-        exit_time_iso,
-        entry_price,
-    )
-
-
-def make_signal_key_str(item: dict) -> str:
-    key = make_signal_key(item)
-    return "|".join("" if x is None else str(x) for x in key)
-
-
-def deduplicate_active_signals() -> None:
-    global active_signals
-
-    seen = set()
-    unique_items = []
-
-    for item in active_signals:
-        key = make_signal_key(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_items.append(item)
-
-    active_signals = unique_items
-
-
 def history_duplicate_exists(item: dict) -> bool:
-    try:
-        item_key = make_signal_key(item)
-
-        for h in signal_history:
-            try:
-                if make_signal_key(h) == item_key:
-                    return True
-            except Exception:
-                continue
-
-        return False
-
-    except Exception:
-        return False
-
-def get_historical_exit_prices_bulk(
-    symbol: str, exit_times_iso: list[str]
-) -> dict[str, float | None]:
-
-    result: dict[str, float | None] = {}
-
-    for exit_time_iso in exit_times_iso:
-        price = get_polygon_exit_price(symbol, exit_time_iso)
-        result[exit_time_iso] = price
-
-    return result
-
-
-def finalize_closed_signal(
-    item: dict,
-    exit_price: float | None,
-    close_reason: str = ""
-) -> dict:
-    item = dict(item)
-    item["closed_at_iso"] = now_iso()
-    item["close_reason"] = close_reason or ""
-    item["status"] = "history"
-
-    entry_price = item.get("entry_price")
+    symbol = item.get("symbol")
     signal = item.get("signal")
+    timeframe = item.get("timeframe")
+    duration_type = item.get("duration_type")
+    entry_time_iso = item.get("entry_time_iso")
 
-    if entry_price is None or signal not in ("BUY", "SELL"):
-        item["result"] = "WAITING_RESULT"
-        item["exit_price"] = None
-        item["profit_value"] = None
-        item["profit_percent"] = None
-        item["last_fact_retry_iso"] = now_iso()
-        return item
+    return any(
+        h.get("symbol") == symbol
+        and h.get("signal") == signal
+        and h.get("timeframe") == timeframe
+        and h.get("duration_type") == duration_type
+        and h.get("entry_time_iso") == entry_time_iso
+        for h in signal_history
+    )
 
-    try:
-        entry_price = float(entry_price)
-    except Exception:
-        item["result"] = "WAITING_RESULT"
-        item["exit_price"] = None
-        item["profit_value"] = None
-        item["profit_percent"] = None
-        item["last_fact_retry_iso"] = now_iso()
-        return item
-
-    if exit_price is None:
-        item["result"] = "WAITING_RESULT"
-        item["exit_price"] = None
-        item["profit_value"] = None
-        item["profit_percent"] = None
-        item["last_fact_retry_iso"] = now_iso()
-        return item
-    try:
-        exit_price = float(exit_price)
-    except Exception:
-        item["result"] = "WAITING_RESULT"
-        item["exit_price"] = None
-        item["profit_value"] = None
-        item["profit_percent"] = None
-        item["last_fact_retry_iso"] = now_iso()
-        return item
-
-    item["exit_price"] = round(exit_price, 5)
-
-    if signal == "BUY":
-        profit_value = exit_price - entry_price
-        item["result"] = "TP" if exit_price >= entry_price else "SL"
-    else:
-        profit_value = entry_price - exit_price
-        item["result"] = "TP" if exit_price <= entry_price else "SL"
-
-    profit_percent = (profit_value / entry_price * 100) if entry_price else 0.0
-
-    item["profit_value"] = round(profit_value, 5)
-    item["profit_percent"] = round(profit_percent, 3)
-
-    return item
 
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
-    stats = calculate_strategy_stats()
-
-    existing_keys = {make_signal_key(s) for s in active_signals}
-    state_changed = False
+    existing_keys = {
+        (
+            s.get("symbol"),
+            s.get("signal"),
+            s.get("timeframe"),
+            s.get("duration_type"),
+            s.get("entry_time_iso"),
+        )
+        for s in active_signals
+    }
 
     for item in items:
-        item = apply_market_regime_bonus(item)
-        item = apply_multitimeframe_confirmation(item)
-        item = apply_volatility_filter(item)
-
-        strategy = item.get("strategy")
-        if strategy in stats:
-            winrate = stats[strategy]
-            item["confidence"] = round(
-                item.get("confidence", 50) * (0.5 + winrate),
-                1
-            )
-
-        try:
-            confidence_value = float(item.get("confidence", 50) or 50)
-        except Exception:
-            confidence_value = 50.0
-
-        item["confidence"] = round(max(1.0, min(100.0, confidence_value)), 1)
-
         signal = item.get("signal")
         entry_time_iso = item.get("entry_time_iso")
+        symbol = item.get("symbol")
+        timeframe = item.get("timeframe")
+        duration_type = item.get("duration_type")
 
         if signal not in ("BUY", "SELL"):
             continue
@@ -521,13 +194,16 @@ def add_signals_to_active(items: list[dict]) -> None:
         if not entry_time_iso:
             continue
 
-        key = make_signal_key(item)
+        key = (
+            symbol,
+            signal,
+            timeframe,
+            duration_type,
+            entry_time_iso,
+        )
 
         if key in existing_keys:
-            logger.info("DUPLICATE SKIPPED: %s", key)
             continue
-
-        logger.info("ACTIVE SIGNAL ADDED: %s", key)
 
         active_signals.append(
             {
@@ -537,12 +213,73 @@ def add_signals_to_active(items: list[dict]) -> None:
                 "result": "OPEN",
             }
         )
-
         existing_keys.add(key)
-        state_changed = True
 
-    if state_changed:
-        save_state_to_db()
+
+def add_signals_to_history(items: list[dict]) -> None:
+    global signal_history
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        signal = item.get("signal", "NONE")
+        symbol = item.get("symbol", "")
+        timeframe = item.get("timeframe", DEFAULT_TIMEFRAME)
+        duration_type = item.get("duration_type", DEFAULT_DURATION_TYPE)
+        entry_time_iso = item.get("entry_time_iso", "")
+        strategy = item.get("strategy", "")
+
+        if signal == "NONE":
+            continue
+
+        history_item = {
+            "symbol": symbol,
+            "signal": signal,
+            "confidence": item.get("confidence", 0.0),
+            "signal_quality": item.get("signal_quality", 0.0),
+            "price": item.get("price"),
+            "entry_price": item.get("entry_price"),
+            "tp": item.get("tp"),
+            "sl": item.get("sl"),
+            "rsi": item.get("rsi", 0.0),
+            "market_regime": item.get("market_regime", "UNKNOWN"),
+            "higher_timeframe_bias": item.get("higher_timeframe_bias", "NONE"),
+            "strategy": strategy,
+            "timeframe": timeframe,
+            "duration_type": duration_type,
+            "recommended_expiry": item.get("recommended_expiry", ""),
+            "entry_time": item.get("entry_time", ""),
+            "exit_time": item.get("exit_time", ""),
+            "entry_time_iso": entry_time_iso,
+            "exit_time_iso": item.get("exit_time_iso", ""),
+            "reason": item.get("reason", ""),
+            "chart_prices": item.get("chart_prices", []),
+            "chart_labels": item.get("chart_labels", []),
+            "candle_buy_bonus": item.get("candle_buy_bonus", 0.0),
+            "candle_sell_bonus": item.get("candle_sell_bonus", 0.0),
+            "level_buy_bonus": item.get("level_buy_bonus", 0.0),
+            "level_sell_bonus": item.get("level_sell_bonus", 0.0),
+            "trend_strength": item.get("trend_strength", 0.0),
+            "volatility_ratio": item.get("volatility_ratio", 0.0),
+            "result": "OPEN",
+            "saved_at": now_iso(),
+        }
+
+        duplicate_exists = any(
+            h.get("symbol") == symbol
+            and h.get("signal") == signal
+            and h.get("timeframe") == timeframe
+            and h.get("duration_type") == duration_type
+            and h.get("entry_time_iso") == entry_time_iso
+            and h.get("strategy") == strategy
+            for h in signal_history
+        )
+
+        if not duplicate_exists:
+            signal_history.insert(0, history_item)
+
+    signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
 
 def update_closed_history_results() -> None:
@@ -554,46 +291,36 @@ def update_closed_history_results() -> None:
 
     for item in active_signals:
         if item.get("result") != "OPEN":
+            still_active.append(item)
             continue
 
         exit_time_iso = item.get("exit_time_iso", "")
-
         if not exit_time_iso:
-            closed_item = finalize_closed_signal(
-                item,
-                exit_price=None,
-                close_reason="missing_exit_time"
-            )
-            if not history_duplicate_exists(closed_item):
-                signal_history.insert(0, closed_item)
+            item["result"] = "CLOSED"
+            item["closed_at_iso"] = now_iso()
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         try:
             exit_dt = parse_iso_utc(exit_time_iso)
         except Exception:
-            closed_item = finalize_closed_signal(
-                item,
-                exit_price=None,
-                close_reason="bad_exit_time"
-            )
-            if not history_duplicate_exists(closed_item):
-                signal_history.insert(0, closed_item)
+            item["result"] = "CLOSED"
+            item["closed_at_iso"] = now_iso()
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
-        # допускаем 2 секунды погрешности
-        if (exit_dt - now_utc).total_seconds() > 2:
+        if exit_dt > now_utc:
             still_active.append(item)
             continue
 
         symbol = item.get("symbol")
         if not symbol:
-            closed_item = finalize_closed_signal(
-                item,
-                exit_price=None,
-                close_reason="missing_symbol"
-            )
-            if not history_duplicate_exists(closed_item):
-                signal_history.insert(0, closed_item)
+            item["result"] = "CLOSED"
+            item["closed_at_iso"] = now_iso()
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
             continue
 
         expired_items_by_symbol.setdefault(symbol, []).append(item)
@@ -609,222 +336,40 @@ def update_closed_history_results() -> None:
 
         for item in items:
             exit_time_iso = item.get("exit_time_iso", "")
+            entry_price = item.get("entry_price")
+            signal = item.get("signal")
             exit_price = price_map.get(exit_time_iso)
 
-            if exit_price is None:
-                closed_item = finalize_closed_signal(
-                    item,
-                    exit_price=None,
-                    close_reason="exit_price_not_found"
-                )
-                if not history_duplicate_exists(closed_item):
-                    signal_history.insert(0, closed_item)
+            if exit_price is None or entry_price is None or signal not in ("BUY", "SELL"):
+                still_active.append(item)
                 continue
 
-            closed_item = finalize_closed_signal(
-                item,
-                exit_price=exit_price,
-                close_reason="market_price_found"
-            )
+            try:
+                exit_price = float(exit_price)
+                entry_price = float(entry_price)
+            except Exception:
+                still_active.append(item)
+                continue
 
-            if not history_duplicate_exists(closed_item):
-                signal_history.insert(0, closed_item)
+            item["exit_price"] = exit_price
+            item["closed_at_iso"] = now_iso()
+
+            if signal == "BUY":
+                item["result"] = "TP" if exit_price >= entry_price else "SL"
+            elif signal == "SELL":
+                item["result"] = "TP" if exit_price <= entry_price else "SL"
+            else:
+                item["result"] = "CLOSED"
+
+            if not history_duplicate_exists(item):
+                signal_history.insert(0, item)
 
     active_signals = still_active
-    signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
-    logger.info(
-        "HISTORY UPDATE: active=%s history=%s waiting=%s tp=%s sl=%s",
-        len(active_signals),
-        len(signal_history),
-        len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
-        len([x for x in signal_history if x.get("result") == "TP"]),
-        len([x for x in signal_history if x.get("result") == "SL"]),
-    )
-
-    save_state_to_db()
-
-
-def update_waiting_history_results() -> None:
-    global signal_history
-
-    waiting_items_by_symbol: dict[str, list[dict]] = {}
-    now_utc = datetime.now(timezone.utc)
-    updated = False
-
-    for item in signal_history:
-        if item.get("result") != "WAITING_RESULT":
-            continue
-
-        symbol = item.get("symbol")
-        exit_time_iso = item.get("exit_time_iso")
-
-        if not symbol or not exit_time_iso:
-            continue
-
-        last_retry_iso = item.get("last_fact_retry_iso")
-        if last_retry_iso:
-            try:
-                last_retry_dt = parse_iso_utc(last_retry_iso)
-                if (now_utc - last_retry_dt).total_seconds() < WAITING_RETRY_SECONDS:
-                    continue
-            except Exception:
-                pass
-
-        waiting_items_by_symbol.setdefault(symbol, []).append(item)
-
-    for symbol, items in waiting_items_by_symbol.items():
-        exit_times_iso = [
-            item.get("exit_time_iso")
-            for item in items
-            if item.get("exit_time_iso")
-        ]
-
-        price_map = get_historical_exit_prices_bulk(symbol, exit_times_iso)
-
-        for idx, hist_item in enumerate(signal_history):
-            if hist_item.get("result") != "WAITING_RESULT":
-                continue
-            if hist_item.get("symbol") != symbol:
-                continue
-
-            exit_time_iso = hist_item.get("exit_time_iso", "")
-            if exit_time_iso not in exit_times_iso:
-                continue
-
-            exit_price = price_map.get(exit_time_iso)
-
-            if exit_price is None:
-                signal_history[idx]["last_fact_retry_iso"] = now_iso()
-                updated = True
-                continue
-
-            signal_history[idx] = finalize_closed_signal(
-                hist_item,
-                exit_price=exit_price,
-                close_reason="waiting_result_resolved"
-            )
-            updated = True
-
-    if updated:
+    if len(signal_history) > MAX_HISTORY_ITEMS:
         signal_history = signal_history[:MAX_HISTORY_ITEMS]
 
-        logger.info(
-            "WAITING RESOLVE: history=%s waiting=%s tp=%s sl=%s",
-            len(signal_history),
-            len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
-            len([x for x in signal_history if x.get("result") == "TP"]),
-            len([x for x in signal_history if x.get("result") == "SL"]),
-        )
 
-        save_state_to_db()
-    
-def apply_multitimeframe_confirmation(item: dict):
-
-    confirm_bias = item.get("confirm_bias")
-    trend_bias = item.get("trend_bias")
-    signal = item.get("signal")
-
-    confidence = item.get("confidence", 50)
-
-    if signal == confirm_bias == trend_bias:
-        confidence *= 1.25
-
-    elif signal == confirm_bias:
-        confidence *= 1.1
-
-    else:
-        confidence *= 0.85
-
-    item["confidence"] = round(confidence, 1)
-
-    return item
-    
-def apply_volatility_filter(item: dict):
-
-    volatility = item.get("volatility_ratio")
-
-    if volatility is None:
-        return item
-
-    confidence = item.get("confidence", 50)
-
-    # рынок слишком тихий
-    if volatility < 0.7:
-        confidence *= 0.7
-
-    # идеальная зона
-    elif 0.8 <= volatility <= 1.2:
-        confidence *= 1.15
-
-    # слишком волатильный
-    elif volatility > 1.5:
-        confidence *= 0.85
-
-    item["confidence"] = round(confidence, 1)
-
-    return item
-    
-def apply_market_regime_bonus(item: dict):
-
-    regime = item.get("market_regime")
-    strategy = item.get("strategy")
-
-    confidence = item.get("confidence", 50)
-
-    if regime == "TREND" and "trend" in str(strategy).lower():
-        confidence *= 1.2
-
-    elif regime == "RANGE" and "rsi" in str(strategy).lower():
-        confidence *= 1.2
-
-    elif regime == "VOLATILE" and "breakout" in str(strategy).lower():
-        confidence *= 1.2
-
-    else:
-        confidence *= 0.9
-
-    item["confidence"] = round(confidence, 1)
-
-    return item
-    
-def calculate_strategy_stats():
-
-    stats = {}
-
-    for item in signal_history:
-
-        strategy = item.get("strategy")
-
-        if not strategy:
-            continue
-
-        result = item.get("result")
-
-        if result not in ("TP", "SL"):
-            continue
-
-        if strategy not in stats:
-            stats[strategy] = {"tp": 0, "sl": 0}
-
-        if result == "TP":
-            stats[strategy]["tp"] += 1
-        else:
-            stats[strategy]["sl"] += 1
-
-    winrate = {}
-
-    for strategy, data in stats.items():
-
-        total = data["tp"] + data["sl"]
-
-        if total == 0:
-            continue
-
-        winrate[strategy] = data["tp"] / total
-
-    return winrate
-    
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
     try:
         result = await asyncio.to_thread(
@@ -853,66 +398,62 @@ async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -
 async def refresh_all_signals() -> None:
     global signal_cache, scan_cache, last_updated_at, last_refresh_status
 
-    async with refresh_lock:
-        logger.info("Фоновое обновление сигналов началось")
+    logger.info("Фоновое обновление сигналов началось")
 
-        tasks = []
-        task_keys = []
+    tasks = []
+    task_keys = []
 
-        for symbol in DEFAULT_SYMBOLS:
-            for timeframe in SCAN_TIMEFRAMES:
-                for duration_type in SCAN_DURATION_TYPES:
-                    tasks.append(analyze_symbol_safe(symbol, timeframe, duration_type))
-                    task_keys.append((symbol, timeframe, duration_type))
+    for symbol in DEFAULT_SYMBOLS:
+        for timeframe in SCAN_TIMEFRAMES:
+            for duration_type in SCAN_DURATION_TYPES:
+                tasks.append(analyze_symbol_safe(symbol, timeframe, duration_type))
+                task_keys.append((symbol, timeframe, duration_type))
 
-        results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks)
 
-        new_cache: Dict[str, Dict[str, Any]] = {}
-        new_scan_cache: Dict[str, Dict[str, Any]] = {}
-        all_results: list[dict] = []
+    new_cache: Dict[str, Dict[str, Any]] = {}
+    new_scan_cache: Dict[str, Dict[str, Any]] = {}
+    all_results: list[dict] = []
 
-        for i, item in enumerate(results):
-            symbol, timeframe, duration_type = task_keys[i]
+    for i, item in enumerate(results):
+        symbol, timeframe, duration_type = task_keys[i]
 
-            if not isinstance(item, dict):
-                continue
+        if not isinstance(item, dict):
+            continue
 
-            item["symbol"] = item.get("symbol", symbol)
-            item["timeframe"] = item.get("timeframe", timeframe)
-            item["duration_type"] = item.get("duration_type", duration_type)
+        item["symbol"] = item.get("symbol", symbol)
+        item["timeframe"] = item.get("timeframe", timeframe)
+        item["duration_type"] = item.get("duration_type", duration_type)
 
-            all_results.append(item)
+        all_results.append(item)
 
-            cache_key = make_cache_key(symbol, timeframe, duration_type)
-            new_scan_cache[cache_key] = item
+        cache_key = make_cache_key(symbol, timeframe, duration_type)
+        new_scan_cache[cache_key] = item
 
-            if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
-                item_symbol = item.get("symbol")
-                if item_symbol:
-                    new_cache[item_symbol] = item
+        if timeframe == DEFAULT_TIMEFRAME and duration_type == DEFAULT_DURATION_TYPE:
+            item_symbol = item.get("symbol")
+            if item_symbol:
+                new_cache[item_symbol] = item
 
-        if new_cache:
-            signal_cache = new_cache
-            scan_cache = new_scan_cache
-            last_updated_at = now_iso()
-            last_refresh_status = "ok"
+    if new_cache:
+        signal_cache = new_cache
+        scan_cache = new_scan_cache
+        last_updated_at = now_iso()
+        last_refresh_status = "ok"
 
-            add_signals_to_active(all_results)
-            deduplicate_active_signals()
-            update_closed_history_results()
-            update_waiting_history_results()
+        add_signals_to_active(all_results)
+        update_closed_history_results()
 
-            logger.info(
-                "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s, history=%s",
-                len(signal_cache),
-                len(scan_cache),
-                len(all_results),
-                len(active_signals),
-                len(signal_history),
-            )
-        else:
-            last_refresh_status = "error"
-            logger.warning("Фоновое обновление не дало результатов")
+        logger.info(
+            "Сигналы обновлены: cache=%s, scan_cache=%s, scanned=%s, active=%s",
+            len(signal_cache),
+            len(scan_cache),
+            len(all_results),
+            len(active_signals),
+        )
+    else:
+        last_refresh_status = "error"
+        logger.warning("Фоновое обновление не дало результатов")
 
 
 async def background_refresh_loop() -> None:
@@ -927,51 +468,15 @@ async def background_refresh_loop() -> None:
 
         await asyncio.sleep(REFRESH_SECONDS)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    postgres_ready = False
-
-    try:
-        init_postgres()
-        postgres_ready = True
-        logger.info("POSTGRES INIT OK")
-    except Exception as e:
-        logger.exception("POSTGRES INIT FAILED, FALLBACK SQLITE: %s", e)
-
-    init_db()
-
-    if postgres_ready:
-        try:
-            load_state_from_postgres()
-
-            if len(active_signals) == 0 and len(signal_history) == 0:
-                logger.info("POSTGRES EMPTY, LOADING SQLITE BACKUP")
-                load_state_from_db()
-                save_state_to_postgres()
-            else:
-                logger.info("STATE LOADED FROM POSTGRES")
-
-        except Exception as e:
-            logger.exception("POSTGRES LOAD FAILED, FALLBACK SQLITE: %s", e)
-            load_state_from_db()
-            try:
-                save_state_to_postgres()
-            except Exception as pg_e:
-                logger.exception("POSTGRES BACKFILL FAILED: %s", pg_e)
-    else:
-        load_state_from_db()
-
-    deduplicate_active_signals()
-    update_closed_history_results()
-    update_waiting_history_results()
-    save_state_to_db()
+    app.state.refresh_task = asyncio.create_task(background_refresh_loop())
 
     try:
         await refresh_all_signals()
     except Exception as e:
         logger.exception("Ошибка стартового прогрева: %s", e)
-
-    app.state.refresh_task = asyncio.create_task(background_refresh_loop())
 
     yield
 
@@ -995,8 +500,6 @@ def root():
         "symbols_count": len(DEFAULT_SYMBOLS),
         "cache_size": len(signal_cache),
         "scan_cache_size": len(scan_cache),
-        "active_signals_count": len(active_signals),
-        "history_count": len(signal_history),
         "refresh_seconds": REFRESH_SECONDS,
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
@@ -1005,19 +508,10 @@ def root():
 
 @app.get("/health")
 def health():
-    waiting_count = len([x for x in signal_history if x.get("result") == "WAITING_RESULT"])
-    tp_count = len([x for x in signal_history if x.get("result") == "TP"])
-    sl_count = len([x for x in signal_history if x.get("result") == "SL"])
-
     return {
         "status": "ok",
         "cache_ready": len(signal_cache) > 0,
         "scan_cache_ready": len(scan_cache) > 0,
-        "active_signals_count": len(active_signals),
-        "history_count": len(signal_history),
-        "history_waiting_count": waiting_count,
-        "history_tp_count": tp_count,
-        "history_sl_count": sl_count,
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
     }
@@ -1030,7 +524,10 @@ def get_signal(
     duration_type: str = Query(default=DEFAULT_DURATION_TYPE),
 ):
     if symbol not in DEFAULT_SYMBOLS:
-        raise HTTPException(status_code=404, detail="Символ не поддерживается")
+        raise HTTPException(
+            status_code=404,
+            detail="Символ не поддерживается",
+        )
 
     cache_key = make_cache_key(symbol, timeframe, duration_type)
     cached = scan_cache.get(cache_key)
@@ -1072,13 +569,13 @@ def get_signals(
 
 
 @app.get("/active_signals")
-def get_active_signals(limit: int = 150):
+def get_active_signals(limit: int = 50):
+    global active_signals
+
     update_closed_history_results()
-    update_waiting_history_results()
 
     now_utc = datetime.now(timezone.utc)
     fresh_items: list[dict] = []
-    seen = set()
 
     for item in active_signals:
         if item.get("result") != "OPEN":
@@ -1096,14 +593,9 @@ def get_active_signals(limit: int = 150):
         if exit_dt <= now_utc:
             continue
 
-        dedupe_key = make_signal_key(item)
-
-        if dedupe_key in seen:
-            logger.info("ACTIVE API DEDUPE SKIPPED: %s", dedupe_key)
-            continue
-
-        seen.add(dedupe_key)
         fresh_items.append(item)
+
+    active_signals = fresh_items
 
     return {
         "items": fresh_items[:limit],
@@ -1127,47 +619,20 @@ async def manual_refresh():
 
 
 @app.get("/history")
-def get_history(limit: int = 150):
-    update_closed_history_results()
-    update_waiting_history_results()
-
-    history_items = [
+def get_history(limit: int = 50):
+    closed_items = [
         item for item in signal_history
-        if item.get("result") in ("WAITING_RESULT", "TP", "SL")
+        if item.get("result") in ("TP", "SL", "CLOSED")
     ]
-
-    waiting_items = [
-        item for item in history_items
-        if item.get("result") == "WAITING_RESULT"
-    ]
-
-    final_items = [
-        item for item in history_items
-        if item.get("result") in ("TP", "SL")
-    ]
-
-    ordered_items = waiting_items + final_items
 
     return {
-        "items": ordered_items[:limit],
-        "count": len(ordered_items),
+        "items": closed_items[:limit],
+        "count": len(closed_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
     }
 
 
-@app.get("/debug/storage")
-def debug_storage():
-    return {
-        "active_signals_count": len(active_signals),
-        "history_count": len(signal_history),
-        "history_waiting_count": len([x for x in signal_history if x.get("result") == "WAITING_RESULT"]),
-        "history_tp_count": len([x for x in signal_history if x.get("result") == "TP"]),
-        "history_sl_count": len([x for x in signal_history if x.get("result") == "SL"]),
-        "database_url_set": bool(DATABASE_URL),
-    }
-    
 @app.get("/feed")
 def get_feed():
     return build_feed()
-
