@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import logging
 
 import pandas as pd
 import requests
@@ -7,6 +8,8 @@ import yfinance as yf
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
+
+logger = logging.getLogger("signal-engine")
 
 DEFAULT_TIMEFRAME = "1h"
 MULTI_TIMEFRAME_MAP = {
@@ -493,24 +496,23 @@ def strategy_bollinger_reversal(df: pd.DataFrame) -> dict[str, Any]:
     bb_lower = float(last["BB_LOWER"])
     bb_upper = float(last["BB_UPPER"])
 
-    if prev_price < bb_lower and price > prev_price:
+    if prev_price < bb_lower and price > prev_price and price > bb_lower:
         return make_strategy_result(
             "Bollinger Reversal",
             "BUY",
             12,
-            ["Цена вышла ниже нижней полосы Bollinger", "Есть возврат вверх"],
+            ["Цена была ниже нижней полосы Bollinger", "Цена вернулась внутрь диапазона", "Есть восстановление вверх"],
         )
 
-    if prev_price > bb_upper and price < prev_price:
+    if prev_price > bb_upper and price < prev_price and price < bb_upper:
         return make_strategy_result(
             "Bollinger Reversal",
             "SELL",
             12,
-            ["Цена вышла выше верхней полосы Bollinger", "Есть возврат вниз"],
+            ["Цена была выше верхней полосы Bollinger", "Цена вернулась внутрь диапазона", "Есть разворот вниз"],
         )
 
     return make_strategy_result("Bollinger Reversal")
-
 
 def strategy_macd_momentum(df: pd.DataFrame) -> dict[str, Any]:
     last = df.iloc[-1]
@@ -672,39 +674,54 @@ def strategy_trend_continuation(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def strategy_rsi_divergence(df: pd.DataFrame) -> dict[str, Any]:
-    if len(df) < 8:
+    if len(df) < 12:
         return make_strategy_result("RSI Divergence")
 
-    recent = df.iloc[-8:]
+    recent = df.iloc[-12:]
 
     current_low = float(recent["Low"].iloc[-1])
-    previous_low = float(recent["Low"].iloc[:-1].min())
+    previous_low = float(recent["Low"].iloc[:-2].min())
 
     current_high = float(recent["High"].iloc[-1])
-    previous_high = float(recent["High"].iloc[:-1].max())
+    previous_high = float(recent["High"].iloc[:-2].max())
 
     current_rsi = float(recent["RSI"].iloc[-1])
-    previous_rsi_min = float(recent["RSI"].iloc[:-1].min())
-    previous_rsi_max = float(recent["RSI"].iloc[:-1].max())
+    previous_rsi_min = float(recent["RSI"].iloc[:-2].min())
+    previous_rsi_max = float(recent["RSI"].iloc[:-2].max())
 
-    if current_low < previous_low and current_rsi > previous_rsi_min:
+    price_drop_ratio = (previous_low - current_low) / previous_low if previous_low else 0.0
+    price_rise_ratio = (current_high - previous_high) / previous_high if previous_high else 0.0
+
+    rsi_bull_gap = current_rsi - previous_rsi_min
+    rsi_bear_gap = previous_rsi_max - current_rsi
+
+    if (
+        current_low < previous_low
+        and price_drop_ratio >= 0.0003
+        and current_rsi <= 42
+        and rsi_bull_gap >= 3.0
+    ):
         return make_strategy_result(
             "RSI Divergence",
             "BUY",
-            17,
-            ["Цена обновила локальный минимум", "RSI не подтвердил новый минимум", "Возможен разворот вверх"],
+            15,
+            ["Цена обновила локальный минимум", "RSI не подтвердил новый минимум", "Есть бычья дивергенция"],
         )
 
-    if current_high > previous_high and current_rsi < previous_rsi_max:
+    if (
+        current_high > previous_high
+        and price_rise_ratio >= 0.0003
+        and current_rsi >= 58
+        and rsi_bear_gap >= 3.0
+    ):
         return make_strategy_result(
             "RSI Divergence",
             "SELL",
-            17,
-            ["Цена обновила локальный максимум", "RSI не подтвердил новый максимум", "Возможен разворот вниз"],
+            15,
+            ["Цена обновила локальный максимум", "RSI не подтвердил новый максимум", "Есть медвежья дивергенция"],
         )
 
     return make_strategy_result("RSI Divergence")
-
 
 def strategy_atr_expansion_breakout(df: pd.DataFrame) -> dict[str, Any]:
     if len(df) < 25:
@@ -843,7 +860,6 @@ def get_level_proximity_bonus(df: pd.DataFrame) -> tuple[float, float]:
 
     return buy_bonus, sell_bonus
 
-
 def round_time_for_timeframe(now_utc: datetime, timeframe: str) -> datetime:
     base = now_utc.replace(second=0, microsecond=0)
 
@@ -878,7 +894,6 @@ def round_time_for_timeframe(now_utc: datetime, timeframe: str) -> datetime:
         return base.replace(hour=0, minute=0) + timedelta(days=1)
 
     return base.replace(minute=0) + timedelta(hours=1)
-
 
 def get_expiry_delta(timeframe: str, duration_type: str) -> timedelta:
     timeframe = normalize_timeframe(timeframe)
@@ -978,9 +993,12 @@ def combine_strategy_results(
     total_votes = buy_count + sell_count
 
     if total_votes == 0:
-        quality_score = 0.0
-    else:
-        quality_score = min(100, round((max(buy_score, sell_score) / (total_votes * 20)) * 100, 1))
+        return "NONE", 0.0, 0.0, "Нет сигнала", "Ни одна стратегия не дала сигнал"
+
+    quality_score = min(
+        100,
+        round((max(buy_score, sell_score) / (total_votes * 20)) * 100, 1)
+    )
 
     buy_score += candle_buy_bonus + level_buy_bonus
     sell_score += candle_sell_bonus + level_sell_bonus
@@ -1000,18 +1018,18 @@ def combine_strategy_results(
         sell_score *= 0.88
 
     if confirm_bias == "BUY":
-        buy_score += 6
-        sell_score = max(sell_score - 1.5, 0.0)
+        buy_score += 3
+        sell_score = max(sell_score - 1.0, 0.0)
     elif confirm_bias == "SELL":
-        sell_score += 6
-        buy_score = max(buy_score - 1.5, 0.0)
+        sell_score += 3
+        buy_score = max(buy_score - 1.0, 0.0)
 
     if trend_bias == "BUY":
-        buy_score += 10
-        sell_score = max(sell_score - 2.5, 0.0)
+        buy_score += 5
+        sell_score = max(sell_score - 1.5, 0.0)
     elif trend_bias == "SELL":
-        sell_score += 10
-        buy_score = max(buy_score - 2.5, 0.0)
+        sell_score += 5
+        buy_score = max(buy_score - 1.5, 0.0)
 
     buy_score = max(buy_score, 0.0)
     sell_score = max(sell_score, 0.0)
@@ -1099,9 +1117,11 @@ def analyze_symbol(
         )
 
     last = signal_df.iloc[-1]
-    market_candle = df.iloc[-1]
+    
+    chart_points = CHART_POINTS_MAP.get(timeframe, 36)
+    chart_df = signal_df.tail(chart_points)
 
-    price = float(market_candle["Close"])
+    price = float(last["Close"])
     rsi = float(last["RSI"])
     atr = float(last["ATR"])
 
@@ -1130,6 +1150,25 @@ def analyze_symbol(
         item["volatility_ratio"] = current_volatility_ratio
         item["trend_strength"] = current_trend_strength
 
+    logger.info(
+        "ANALYZE %s tf=%s dur=%s regime=%s confirm=%s trend=%s strategies=%s",
+        symbol,
+        timeframe,
+        duration_type,
+        market_regime,
+        confirm_bias,
+        trend_bias,
+        [
+            {
+                "name": s["name"],
+                "signal": s["signal"],
+                "score": s["score"],
+            }
+            for s in strategy_results
+            if s["signal"] != "NONE"
+        ],
+    )
+
     signal, confidence, quality_score, strategy_name, reason = combine_strategy_results(
         strategy_results,
         market_regime,
@@ -1140,12 +1179,35 @@ def analyze_symbol(
         level_buy_bonus,
         level_sell_bonus,
     )
+    
+    logger.info(
+        "COMBINED %s tf=%s dur=%s signal=%s confidence=%.1f quality=%.1f strategy=%s reason=%s",
+        symbol,
+        timeframe,
+        duration_type,
+        signal,
+        confidence,
+        quality_score,
+        strategy_name,
+        reason,
+    )
 
     min_confidence = 38.0
     min_quality = 30.0
 
     if signal != "NONE":
         if confidence < min_confidence or quality_score < min_quality:
+            logger.info(
+                "FILTERED_IN_ENGINE_WEAK %s tf=%s dur=%s signal=%s confidence=%.1f quality=%.1f min_conf=%.1f min_quality=%.1f",
+                symbol,
+                timeframe,
+                duration_type,
+                signal,
+                confidence,
+                quality_score,
+                min_confidence,
+                min_quality,
+            )
             signal = "NONE"
             strategy_name = "Нет сигнала"
             reason = f"Сигнал слишком слабый: confidence={confidence}, quality={quality_score}"
@@ -1153,6 +1215,16 @@ def analyze_symbol(
     if signal != "NONE":
         if confirm_bias != "NONE" and trend_bias != "NONE" and confirm_bias != trend_bias:
             if confidence < 45:
+                logger.info(
+                    "FILTERED_IN_ENGINE_TF_CONFLICT %s tf=%s dur=%s signal=%s confidence=%.1f confirm=%s trend=%s",
+                    symbol,
+                    timeframe,
+                    duration_type,
+                    signal,
+                    confidence,
+                    confirm_bias,
+                    trend_bias,
+                )
                 signal = "NONE"
                 strategy_name = "Нет сигнала"
                 reason = (
@@ -1172,6 +1244,7 @@ def analyze_symbol(
     else:
         now_utc = datetime.now(timezone.utc)
         entry_dt_utc = round_time_for_timeframe(now_utc, timeframe)
+
         expiry_delta = get_expiry_delta(timeframe, duration_type)
         exit_dt_utc = entry_dt_utc + expiry_delta
 
@@ -1182,7 +1255,7 @@ def analyze_symbol(
         exit_time_iso = exit_dt_utc.isoformat().replace("+00:00", "Z")
         recommended_expiry = format_expiry_label(expiry_delta)
 
-        entry_price = price
+        entry_price = round(float(chart_df["Close"].iloc[-1]), 5) if not chart_df.empty else round(price, 5)
 
         rr_multiplier = 1.8 if duration_type == "short" else 2.2
         sl_multiplier = 1.0 if duration_type == "short" else 1.2
@@ -1194,15 +1267,26 @@ def analyze_symbol(
             tp = price - atr * rr_multiplier
             sl = price + atr * sl_multiplier
 
-    chart_points = CHART_POINTS_MAP.get(timeframe, 36)
-    chart_df = df.tail(chart_points)
-
-    if timeframe == "1d":
-        chart_labels = [idx.strftime("%d.%m") for idx in chart_df.index]
-    else:
-        chart_labels = [idx.strftime("%d %H:%M") for idx in chart_df.index]
+    chart_labels = [
+        idx.tz_convert("UTC").isoformat().replace("+00:00", "Z")
+        if getattr(idx, "tzinfo", None) is not None
+        else idx.tz_localize("UTC").isoformat().replace("+00:00", "Z")
+        for idx in chart_df.index
+    ]
 
     chart_prices = [round(float(x), 5) for x in chart_df["Close"].tolist()]
+
+    logger.info(
+        "ENGINE_RESULT %s tf=%s dur=%s final_signal=%s confidence=%.1f quality=%.1f entry=%s exit=%s",
+        symbol,
+        timeframe,
+        duration_type,
+        signal,
+        confidence,
+        quality_score,
+        entry_time_iso,
+        exit_time_iso,
+    )
 
     return {
         "symbol": symbol,
