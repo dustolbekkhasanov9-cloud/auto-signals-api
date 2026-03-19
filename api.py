@@ -1251,3 +1251,53 @@ def debug_storage():
 @app.get("/feed")
 def get_feed():
     return build_feed()
+@app.get("/mt5_signal")
+def get_mt5_signal(
+    symbol: str = Query(...),
+    timeframe: str = Query(default="5m"),
+    duration_type: str = Query(default="short"),
+):
+    try:
+        data = analyze_symbol(
+            symbol=symbol,
+            timeframe=timeframe,
+            duration_type=duration_type,
+        )
+
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=500, detail="Некорректный ответ analyze_symbol")
+
+        signal = str(data.get("signal", "NONE")).upper()
+        confidence = float(data.get("confidence", 0.0) or 0.0)
+
+        if signal not in ("BUY", "SELL"):
+            return {
+                "ok": True,
+                "symbol": symbol.replace("=X", ""),
+                "signal": "NONE",
+                "confidence": confidence,
+                "reason": data.get("reason", "Нет сигнала"),
+                "signal_key": "",
+            }
+
+        entry_time_iso = data.get("entry_time_iso", "") or ""
+
+        return {
+            "ok": True,
+            "symbol": symbol.replace("=X", ""),
+            "signal": signal,
+            "confidence": confidence,
+            "entry_price": data.get("entry_price"),
+            "tp": data.get("tp"),
+            "sl": data.get("sl"),
+            "entry_time_iso": entry_time_iso,
+            "exit_time_iso": data.get("exit_time_iso", "") or "",
+            "timeframe": timeframe,
+            "duration_type": duration_type,
+            "reason": data.get("reason", ""),
+            "signal_key": f"{symbol}|{timeframe}|{duration_type}|{signal}|{entry_time_iso}",
+        }
+
+    except Exception as e:
+        logger.exception("MT5 SIGNAL ERROR: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
