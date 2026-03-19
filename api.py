@@ -9,6 +9,7 @@ import time
 from typing import Any, Dict
 
 import psycopg2
+import requests
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Query
 
@@ -19,9 +20,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autosignal-api")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 
 if not DATABASE_URL:
     logger.warning("DATABASE_URL not set")
+    
+if not POLYGON_API_KEY:
+    logger.warning("POLYGON_API_KEY not set")
 
 
 DEFAULT_SYMBOLS = [
@@ -369,6 +374,82 @@ def parse_chart_label_to_utc(label: Any) -> datetime | None:
 
     return None
 
+def get_polygon_exit_price(item: dict) -> float | None:
+    if not POLYGON_API_KEY:
+        return None
+
+    symbol = item.get("symbol")
+    exit_time_iso = item.get("exit_time_iso")
+
+    if not symbol or not exit_time_iso:
+        return None
+
+    try:
+        exit_dt = parse_iso_utc(exit_time_iso)
+    except Exception:
+        return None
+
+    try:
+        pair = symbol.replace("=X", "")
+        ticker = f"C:{pair}"
+
+        from_ns = int((exit_dt - timedelta(minutes=10)).timestamp() * 1_000_000_000)
+        to_ns = int((exit_dt + timedelta(minutes=10)).timestamp() * 1_000_000_000)
+
+        url = (
+            f"https://api.polygon.io/v3/quotes/{ticker}"
+            f"?timestamp.gte={from_ns}"
+            f"&timestamp.lte={to_ns}"
+            f"&order=asc&limit=50000&sort=timestamp"
+            f"&apiKey={POLYGON_API_KEY}"
+        )
+
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        results = data.get("results", [])
+        if not results:
+            logger.info("POLYGON EXIT PRICE: no quotes for %s around %s", symbol, exit_time_iso)
+            return None
+
+        best_future_price = None
+        best_future_ts = None
+        best_past_price = None
+        best_past_ts = None
+
+        exit_ns = int(exit_dt.timestamp() * 1_000_000_000)
+
+        for q in results:
+            ts = q.get("participant_timestamp") or q.get("sip_timestamp") or q.get("t")
+            bid = safe_float(q.get("bid_price"))
+            ask = safe_float(q.get("ask_price"))
+
+            if ts is None or bid is None or ask is None:
+                continue
+
+            mid = (bid + ask) / 2.0
+
+            if ts >= exit_ns:
+                if best_future_ts is None or ts < best_future_ts:
+                    best_future_ts = ts
+                    best_future_price = mid
+            else:
+                if best_past_ts is None or ts > best_past_ts:
+                    best_past_ts = ts
+                    best_past_price = mid
+
+        if best_future_price is not None:
+            return round(best_future_price, 5)
+
+        if best_past_price is not None:
+            return round(best_past_price, 5)
+
+        return None
+
+    except Exception as e:
+        logger.exception("POLYGON EXIT PRICE FAILED for %s: %s", symbol, e)
+        return None
 
 def get_exit_price_from_chart(item: dict) -> float | None:
     exit_time_iso = item.get("exit_time_iso")
@@ -436,6 +517,10 @@ def get_exit_price_from_chart(item: dict) -> float | None:
 
 
 def get_latest_exit_price_for_item(item: dict) -> float | None:
+    polygon_exit_price = get_polygon_exit_price(item)
+    if polygon_exit_price is not None:
+        return polygon_exit_price
+
     chart_exit_price = get_exit_price_from_chart(item)
     if chart_exit_price is not None:
         return chart_exit_price
