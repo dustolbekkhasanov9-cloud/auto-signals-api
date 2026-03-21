@@ -2,16 +2,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 import logging
 
-import os
-
 import pandas as pd
 import requests
+import yfinance as yf
 
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 
 logger = logging.getLogger("signal-engine")
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
 
 DEFAULT_TIMEFRAME = "1h"
 MULTI_TIMEFRAME_MAP = {
@@ -31,15 +29,6 @@ TIMEFRAME_CONFIG = {
     "30m": {"fetch_interval": "30m", "period": "20d", "resample": None},
     "1h": {"fetch_interval": "60m", "period": "30d", "resample": None},
     "1d": {"fetch_interval": "1d", "period": "6mo", "resample": None},
-}
-
-POLYGON_TIMESPAN_MAP = {
-    "5m": (5, "minute"),
-    "10m": (10, "minute"),
-    "15m": (15, "minute"),
-    "30m": (30, "minute"),
-    "1h": (1, "hour"),
-    "1d": (1, "day"),
 }
 
 TIMEFRAME_LABELS = {
@@ -163,63 +152,42 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame | None:
     timeframe = normalize_timeframe(timeframe)
     cfg = TIMEFRAME_CONFIG[timeframe]
+    fetch_interval = cfg["fetch_interval"]
     period = cfg["period"]
     days = period_to_days(period)
 
     try:
-        if not POLYGON_API_KEY:
-            logger.warning("POLYGON_API_KEY not set")
-            return None
-
-        pair = symbol.replace("=X", "")
-        multiplier, timespan = POLYGON_TIMESPAN_MAP[timeframe]
-
         now_utc = datetime.now(timezone.utc)
-        from_dt = now_utc - timedelta(days=days)
-
-        ticker = f"C:{pair}"
-        from_str = from_dt.strftime("%Y-%m-%d")
-        to_str = now_utc.strftime("%Y-%m-%d")
+        period1 = int((now_utc - timedelta(days=days)).timestamp())
+        period2 = int(now_utc.timestamp())
 
         url = (
-            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/"
-            f"{multiplier}/{timespan}/{from_str}/{to_str}"
-            f"?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_API_KEY}"
+            f"https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?period1={period1}&period2={period2}&interval={fetch_interval}"
         )
+        headers = {"User-Agent": "Mozilla/5.0"}
 
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
+        r = requests.get(url, headers=headers, timeout=12)
         data = r.json()
+        r.raise_for_status()
 
-        results = data.get("results", [])
-        if not results:
-            logger.warning("POLYGON returned no results for %s %s", symbol, timeframe)
-            return None
+        result = data["chart"]["result"][0]
+        ts = result["timestamp"]
+        quote = result["indicators"]["quote"][0]
 
-        df = pd.DataFrame(results)
-        df["Date"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+        df = pd.DataFrame(quote)
+        df["Date"] = pd.to_datetime(ts, unit="s", utc=True)
         df.set_index("Date", inplace=True)
-
         df.rename(
             columns={
-                "o": "Open",
-                "h": "High",
-                "l": "Low",
-                "c": "Close",
-                "v": "Volume",
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "volume": "Volume",
             },
             inplace=True,
         )
-
-        for col in ["Open", "High", "Low", "Close"]:
-            if col not in df.columns:
-                logger.warning("POLYGON missing column %s for %s %s", col, symbol, timeframe)
-                return None
-
-        if "Volume" not in df.columns:
-            df["Volume"] = 0
-
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.dropna(inplace=True)
 
         if cfg["resample"]:
@@ -227,9 +195,45 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
 
         return df if not df.empty else None
 
-    except Exception as e:
-        logger.exception("POLYGON fetch_data failed for %s %s: %s", symbol, timeframe, e)
-        return None
+    except Exception:
+        try:
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=fetch_interval,
+                progress=False,
+                threads=False,
+                auto_adjust=True,
+            )
+
+            if df is None or df.empty:
+                return None
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+            df = df.rename(columns=lambda c: str(c).capitalize())
+
+            for col in ["Open", "High", "Low", "Close"]:
+                if col not in df.columns:
+                    return None
+
+            if "Volume" not in df.columns:
+                df["Volume"] = 0
+
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+
+            df.dropna(inplace=True)
+
+            if cfg["resample"]:
+                df = resample_ohlcv(df, cfg["resample"])
+
+            return df if not df.empty else None
+        except Exception:
+            return None
 
 
 def ema(series: pd.Series, period: int) -> pd.Series:
