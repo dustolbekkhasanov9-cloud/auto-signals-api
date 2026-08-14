@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 import logging
+import os
+import threading
+import time
 
 import pandas as pd
 import requests
@@ -10,6 +13,19 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 
 logger = logging.getLogger("signal-engine")
+
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+MARKET_DATA_API_KEY = MASSIVE_API_KEY or POLYGON_API_KEY
+MARKET_DATA_BASE_URL = os.environ.get(
+    "MARKET_DATA_BASE_URL",
+    "https://api.massive.com" if MASSIVE_API_KEY else "https://api.polygon.io",
+)
+MARKET_DATA_PROVIDER = "massive" if MASSIVE_API_KEY else "polygon"
+DATA_CACHE_TTL_SECONDS = 30
+
+_data_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
+_data_cache_lock = threading.Lock()
 
 DEFAULT_TIMEFRAME = "1h"
 MULTI_TIMEFRAME_MAP = {
@@ -29,6 +45,15 @@ TIMEFRAME_CONFIG = {
     "30m": {"fetch_interval": "30m", "period": "20d", "resample": None},
     "1h": {"fetch_interval": "60m", "period": "30d", "resample": None},
     "1d": {"fetch_interval": "1d", "period": "6mo", "resample": None},
+}
+
+MARKET_AGG_CONFIG = {
+    "5m": (5, "minute"),
+    "10m": (10, "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1h": (1, "hour"),
+    "1d": (1, "day"),
 }
 
 TIMEFRAME_LABELS = {
@@ -83,6 +108,7 @@ def empty_signal_payload(
         "signal": "NONE",
         "confidence": 0.0,
         "signal_quality": 0.0,
+        "confidence_type": "heuristic_signal_strength",
         "rsi": None,
         "tp": None,
         "sl": None,
@@ -90,6 +116,10 @@ def empty_signal_payload(
         "confirm_bias": "NONE",
         "trend_bias": "NONE",
         "strategy": "Нет сигнала",
+        "strategy_signals": [],
+        "analysis_data_source": None,
+        "analysis_bar_time_iso": None,
+        "forecast_created_at_iso": datetime.now(timezone.utc).isoformat(),
         "candle_buy_bonus": 0.0,
         "candle_sell_bonus": 0.0,
         "level_buy_bonus": 0.0,
@@ -149,12 +179,65 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return ohlcv
 
 
-def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame | None:
+def _cache_market_data(symbol: str, timeframe: str, df: pd.DataFrame) -> pd.DataFrame:
+    with _data_cache_lock:
+        _data_cache[(symbol, timeframe)] = (time.monotonic(), df.copy())
+    return df
+
+
+def _fetch_market_aggregates(
+    symbol: str,
+    timeframe: str,
+    days: int,
+) -> pd.DataFrame | None:
+    if not MARKET_DATA_API_KEY:
+        return None
+
+    multiplier, timespan = MARKET_AGG_CONFIG[timeframe]
+    pair = symbol.replace("=X", "").replace("-", "")
+    ticker = f"C:{pair}"
+    now_utc = datetime.now(timezone.utc)
+    start_utc = now_utc - timedelta(days=days)
+
+    response = requests.get(
+        (
+            f"{MARKET_DATA_BASE_URL}/v2/aggs/ticker/{ticker}/range/"
+            f"{multiplier}/{timespan}/{start_utc:%Y-%m-%d}/{now_utc:%Y-%m-%d}"
+        ),
+        params={
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": 50000,
+            "apiKey": MARKET_DATA_API_KEY,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    rows = response.json().get("results", [])
+    if not rows:
+        return None
+
+    df = pd.DataFrame(
+        {
+            "Open": [row.get("o") for row in rows],
+            "High": [row.get("h") for row in rows],
+            "Low": [row.get("l") for row in rows],
+            "Close": [row.get("c") for row in rows],
+            "Volume": [row.get("v", 0) for row in rows],
+            "Date": pd.to_datetime([row.get("t") for row in rows], unit="ms", utc=True),
+        }
+    )
+    df.set_index("Date", inplace=True)
+    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
+    df.attrs["source"] = f"{MARKET_DATA_PROVIDER}_aggregates"
+    return df if not df.empty else None
+
+
+def _fetch_yahoo_data(symbol: str, timeframe: str, days: int) -> pd.DataFrame | None:
     timeframe = normalize_timeframe(timeframe)
     cfg = TIMEFRAME_CONFIG[timeframe]
     fetch_interval = cfg["fetch_interval"]
     period = cfg["period"]
-    days = period_to_days(period)
 
     try:
         now_utc = datetime.now(timezone.utc)
@@ -193,6 +276,7 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
         if cfg["resample"]:
             df = resample_ohlcv(df, cfg["resample"])
 
+        df.attrs["source"] = "yahoo_fallback"
         return df if not df.empty else None
 
     except Exception:
@@ -231,9 +315,35 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
             if cfg["resample"]:
                 df = resample_ohlcv(df, cfg["resample"])
 
+            df.attrs["source"] = "yfinance_fallback"
             return df if not df.empty else None
         except Exception:
             return None
+
+
+def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame | None:
+    timeframe = normalize_timeframe(timeframe)
+    cache_key = (symbol, timeframe)
+    now_monotonic = time.monotonic()
+
+    with _data_cache_lock:
+        cached = _data_cache.get(cache_key)
+        if cached and now_monotonic - cached[0] <= DATA_CACHE_TTL_SECONDS:
+            return cached[1].copy()
+
+    days = period_to_days(TIMEFRAME_CONFIG[timeframe]["period"])
+
+    try:
+        market_df = _fetch_market_aggregates(symbol, timeframe, days)
+        if market_df is not None and not market_df.empty:
+            return _cache_market_data(symbol, timeframe, market_df)
+    except Exception as error:
+        logger.warning("MARKET AGGREGATES FAILED %s %s: %s", symbol, timeframe, error)
+
+    fallback_df = _fetch_yahoo_data(symbol, timeframe, days)
+    if fallback_df is not None and not fallback_df.empty:
+        return _cache_market_data(symbol, timeframe, fallback_df)
+    return None
 
 
 def ema(series: pd.Series, period: int) -> pd.Series:
@@ -332,16 +442,14 @@ def detect_market_regime(df: pd.DataFrame) -> str:
     ema20 = float(last["EMA20"])
     ema50 = float(last["EMA50"])
     atr = float(last["ATR"])
-    price = float(last["Close"])
-
     ema_gap = abs(ema20 - ema50)
-    atr_ratio = atr / price if price else 0.0
+    trend_strength = ema_gap / atr if atr > 0 else 0.0
 
-    if ema_gap < atr * 0.35:
+    if trend_strength < 0.35:
         return "FLAT"
-    if ema20 > ema50 and atr_ratio >= 0.0015:
+    if ema20 > ema50 and trend_strength >= 0.75:
         return "UPTREND"
-    if ema20 < ema50 and atr_ratio >= 0.0015:
+    if ema20 < ema50 and trend_strength >= 0.75:
         return "DOWNTREND"
     return "RANGE"
 
@@ -917,6 +1025,19 @@ def format_expiry_label(delta: timedelta) -> str:
     return f"{days}d"
 
 
+def is_forex_market_open(at_utc: datetime) -> bool:
+    """Conservative 24/5 session guard (holiday closures are quote-validated later)."""
+    at_utc = at_utc.astimezone(timezone.utc)
+    weekday = at_utc.weekday()
+    if weekday == 5:
+        return False
+    if weekday == 6 and at_utc.hour < 22:
+        return False
+    if weekday == 4 and at_utc.hour >= 22:
+        return False
+    return True
+
+
 def combine_strategy_results(
     results: list[dict[str, Any]],
     market_regime: str,
@@ -926,8 +1047,24 @@ def combine_strategy_results(
     candle_sell_bonus: float = 0.0,
     level_buy_bonus: float = 0.0,
     level_sell_bonus: float = 0.0,
-) -> tuple[str, float, float, str, str]:
+) -> tuple[str, float, float, str, str, list[dict[str, Any]]]:
     adjusted_results = []
+
+    trend_strategies = {
+        "EMA Pullback",
+        "MACD Momentum",
+        "Heikin Ashi Trend",
+        "Trend Continuation",
+    }
+    reversal_strategies = {
+        "RSI Reversal",
+        "Bollinger Reversal",
+        "Support Bounce",
+        "Resistance Bounce",
+        "Support/Resistance",
+        "RSI Divergence",
+    }
+    breakout_strategies = {"Breakout", "ATR Expansion Breakout"}
 
     for r in results:
         item = dict(r)
@@ -935,6 +1072,29 @@ def combine_strategy_results(
         name = item["name"]
         volatility_ratio = float(item.get("volatility_ratio", 1.0))
         trend_strength = float(item.get("trend_strength", 1.0))
+
+        # A strategy is allowed to vote only in a market regime where its
+        # assumptions make sense. Counter-trend reversals are not allowed to
+        # overturn a confirmed trend, and breakouts in a range require an
+        # actual volatility expansion.
+        expected_trend_signal = "BUY" if market_regime == "UPTREND" else "SELL"
+        if (
+            market_regime in ("UPTREND", "DOWNTREND")
+            and name in reversal_strategies
+            and item.get("signal") not in ("NONE", expected_trend_signal)
+        ):
+            item["signal"] = "NONE"
+            score = 0.0
+        elif market_regime in ("FLAT", "RANGE") and name in trend_strategies:
+            item["signal"] = "NONE"
+            score = 0.0
+        elif (
+            market_regime in ("FLAT", "RANGE")
+            and name in breakout_strategies
+            and volatility_ratio < 1.05
+        ):
+            item["signal"] = "NONE"
+            score = 0.0
 
         if market_regime in ("UPTREND", "DOWNTREND"):
             if name in ("EMA Pullback", "MACD Momentum", "Trend Continuation"):
@@ -993,12 +1153,7 @@ def combine_strategy_results(
     total_votes = buy_count + sell_count
 
     if total_votes == 0:
-        return "NONE", 0.0, 0.0, "Нет сигнала", "Ни одна стратегия не дала сигнал"
-
-    quality_score = min(
-        100,
-        round((max(buy_score, sell_score) / (total_votes * 20)) * 100, 1)
-    )
+        return "NONE", 0.0, 0.0, "Нет сигнала", "Ни одна стратегия не дала сигнал", []
 
     buy_score += candle_buy_bonus + level_buy_bonus
     sell_score += candle_sell_bonus + level_sell_bonus
@@ -1047,21 +1202,32 @@ def combine_strategy_results(
         winning_strategies = [r["name"] for r in adjusted_results if r["signal"] == "SELL"]
         winning_reasons = [reason for r in adjusted_results if r["signal"] == "SELL" for reason in r["reasons"]]
     else:
-        return "NONE", 0.0, 0.0, "Нет сигнала", "Недостаточно оснований"
+        return "NONE", 0.0, 0.0, "Нет сигнала", "Недостаточно оснований", []
 
     total_score = winning_score + losing_score
-    conflict_penalty = 0.0
+    winning_count = buy_count if signal == "BUY" else sell_count
+    average_winning_score = winning_score / max(winning_count, 1)
+    score_strength = min(average_winning_score / 22.0, 1.0)
+    strategy_breadth = min(winning_count / 3.0, 1.0)
+    directional_agreement = winning_score / total_score if total_score > 0 else 0.0
 
-    if total_score > 0:
-        conflict_ratio = losing_score / total_score
-        if conflict_ratio >= 0.45:
-            conflict_penalty = 8.0
-        elif conflict_ratio >= 0.35:
-            conflict_penalty = 5.0
-        elif conflict_ratio >= 0.25:
-            conflict_penalty = 2.5
+    quality_score = round(
+        (score_strength * 0.65 + strategy_breadth * 0.35) * 100,
+        1,
+    )
+    confidence = round(
+        quality_score * 0.70 + directional_agreement * 100 * 0.30,
+        1,
+    )
 
-    confidence = round((winning_score * 0.6) + (quality_score * 0.4) - conflict_penalty, 1)
+    # One isolated strategy can be useful, but must never look like a highly
+    # certain forecast. Multiple independent confirmations raise the ceiling.
+    if winning_count == 1:
+        confidence = min(confidence, 68.0)
+    elif winning_count == 2:
+        confidence = min(confidence, 84.0)
+    else:
+        confidence = min(confidence, 90.0)
     confidence = max(confidence, 0.0)
 
     strategy_name = " + ".join(winning_strategies[:3]) if winning_strategies else "Нет сигнала"
@@ -1080,7 +1246,24 @@ def combine_strategy_results(
 
     reason_text = "; ".join(reason_parts) if reason_parts else "Нет оснований"
 
-    return signal, confidence, quality_score, strategy_name, reason_text
+    effective_strategy_signals = [
+        {
+            "name": item["name"],
+            "signal": item["signal"],
+            "score": round(float(item["score"]), 2),
+        }
+        for item in adjusted_results
+        if item["signal"] == signal
+    ]
+
+    return (
+        signal,
+        confidence,
+        quality_score,
+        strategy_name,
+        reason_text,
+        effective_strategy_signals,
+    )
 
 
 def analyze_symbol(
@@ -1097,6 +1280,7 @@ def analyze_symbol(
     if df is None or df.empty or len(df) < min_bars:
         return empty_signal_payload(symbol, "Недостаточно данных", timeframe, duration_type)
 
+    analysis_data_source = df.attrs.get("source", "unknown")
     df = build_indicators(df)
 
     if df is None or df.empty or len(df) < 30:
@@ -1169,7 +1353,7 @@ def analyze_symbol(
         ],
     )
 
-    signal, confidence, quality_score, strategy_name, reason = combine_strategy_results(
+    signal, confidence, quality_score, strategy_name, reason, strategy_signals = combine_strategy_results(
         strategy_results,
         market_regime,
         confirm_bias,
@@ -1192,8 +1376,8 @@ def analyze_symbol(
         reason,
     )
 
-    min_confidence = 38.0
-    min_quality = 30.0
+    min_confidence = 55.0
+    min_quality = 40.0
 
     if signal != "NONE":
         if confidence < min_confidence or quality_score < min_quality:
@@ -1210,6 +1394,7 @@ def analyze_symbol(
             )
             signal = "NONE"
             strategy_name = "Нет сигнала"
+            strategy_signals = []
             reason = f"Сигнал слишком слабый: confidence={confidence}, quality={quality_score}"
 
     if signal != "NONE":
@@ -1227,10 +1412,18 @@ def analyze_symbol(
                 )
                 signal = "NONE"
                 strategy_name = "Нет сигнала"
+                strategy_signals = []
                 reason = (
                     f"Конфликт таймфреймов: confirm={confirm_bias}, "
                     f"trend={trend_bias}, confidence={confidence}"
                 )
+
+    now_utc = datetime.now(timezone.utc)
+    if signal != "NONE" and not is_forex_market_open(now_utc):
+        signal = "NONE"
+        strategy_name = "Рынок закрыт"
+        strategy_signals = []
+        reason = "Forex закрыт: новый прогноз будет сформирован после открытия рынка"
 
     if signal == "NONE":
         entry_price = None
@@ -1242,7 +1435,6 @@ def analyze_symbol(
         exit_time_iso = ""
         recommended_expiry = ""
     else:
-        now_utc = datetime.now(timezone.utc)
         entry_dt_utc = round_time_for_timeframe(now_utc, timeframe)
 
         expiry_delta = get_expiry_delta(timeframe, duration_type)
@@ -1299,6 +1491,7 @@ def analyze_symbol(
         "signal": signal,
         "confidence": confidence,
         "signal_quality": quality_score,
+        "confidence_type": "heuristic_signal_strength",
         "rsi": round(rsi, 2),
         "tp": round(float(tp), 5) if tp is not None else None,
         "sl": round(float(sl), 5) if sl is not None else None,
@@ -1306,6 +1499,10 @@ def analyze_symbol(
         "confirm_bias": confirm_bias,
         "trend_bias": trend_bias,
         "strategy": strategy_name,
+        "strategy_signals": strategy_signals,
+        "analysis_data_source": analysis_data_source,
+        "analysis_bar_time_iso": chart_labels[-1] if chart_labels else None,
+        "forecast_created_at_iso": datetime.now(timezone.utc).isoformat(),
         "candle_buy_bonus": candle_buy_bonus,
         "candle_sell_bonus": candle_sell_bonus,
         "level_buy_bonus": level_buy_bonus,

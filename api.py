@@ -24,6 +24,7 @@ from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Query
 
 from signal_engine import analyze_symbol
+from news_context import get_news_context, news_settings
 
 
 logging.basicConfig(level=logging.INFO)
@@ -71,9 +72,23 @@ SCAN_DURATION_TYPES = ["short", "long"]
 
 ANALYZE_CONCURRENCY = 4
 
-MIN_CONFIDENCE_TO_KEEP = 30.0
-MIN_VOLATILITY_RATIO = 0.75
-REQUIRE_AT_LEAST_ONE_BIAS_MATCH = True
+MIN_CONFIDENCE_TO_KEEP = float(os.environ.get("MIN_CONFIDENCE_TO_KEEP", "55"))
+MIN_VOLATILITY_RATIO = float(os.environ.get("MIN_VOLATILITY_RATIO", "0.75"))
+REQUIRE_AT_LEAST_ONE_BIAS_MATCH = os.environ.get(
+    "REQUIRE_AT_LEAST_ONE_BIAS_MATCH", "true"
+).lower() == "true"
+REQUIRE_REAL_ANALYSIS_SOURCE = os.environ.get(
+    "REQUIRE_REAL_ANALYSIS_SOURCE", "true"
+).lower() == "true"
+LIVE_QUOTE_CACHE_SECONDS = 5
+LIVE_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("LIVE_QUOTE_MAX_AGE_SECONDS", "60"))
+EXPERIENCE_MIN_SAMPLES = int(os.environ.get("EXPERIENCE_MIN_SAMPLES", "30"))
+EXPERIENCE_PRIOR_SAMPLES = float(os.environ.get("EXPERIENCE_PRIOR_SAMPLES", "20"))
+EXPERIENCE_MAX_ADJUSTMENT = float(os.environ.get("EXPERIENCE_MAX_ADJUSTMENT", "0.10"))
+REAL_ANALYSIS_SOURCES = {"massive_aggregates", "polygon_aggregates"}
+NEWS_MAX_CONFIDENCE_ADJUSTMENT = float(
+    os.environ.get("NEWS_MAX_CONFIDENCE_ADJUSTMENT", "5")
+)
 
 signal_cache: Dict[str, Dict[str, Any]] = {}
 scan_cache: Dict[str, Dict[str, Any]] = {}
@@ -84,6 +99,7 @@ active_signals: list[dict] = []
 signal_history: list[dict] = []
 
 refresh_lock = asyncio.Lock()
+live_quote_cache: Dict[str, tuple[float, dict]] = {}
 
 
 def parse_iso_utc(value: str) -> datetime:
@@ -335,6 +351,26 @@ def deduplicate_active_signals() -> None:
     active_signals = unique_items
 
 
+def prune_legacy_active_signals() -> int:
+    """Drop forecasts created before real analysis and live-quote validation."""
+    global active_signals
+
+    before = len(active_signals)
+    active_signals = [
+        item
+        for item in active_signals
+        if item.get("analysis_data_source") in REAL_ANALYSIS_SOURCES
+        and item.get("confidence_type") == "heuristic_signal_strength"
+        and item.get("price_source")
+        and item.get("live_quote_time_iso")
+        and item.get("strategy_signals")
+    ]
+    removed = before - len(active_signals)
+    if removed:
+        logger.info("PRUNED LEGACY ACTIVE SIGNALS: %s", removed)
+    return removed
+
+
 def deduplicate_signal_history() -> None:
     global signal_history
 
@@ -390,6 +426,13 @@ def has_real_exit(item: dict) -> bool:
 
 def has_verified_execution(item: dict) -> bool:
     return has_real_entry(item) and has_real_exit(item)
+
+
+def has_verified_analysis(item: dict) -> bool:
+    return (
+        item.get("analysis_data_source") in REAL_ANALYSIS_SOURCES
+        and item.get("confidence_type") == "heuristic_signal_strength"
+    )
 
 
 def parse_chart_label_to_utc(label: Any) -> datetime | None:
@@ -452,7 +495,14 @@ def get_real_quote(symbol: str, target_dt: datetime, signal: str, phase: str) ->
         if not candidates:
             return None
 
-        _, timestamp_ns, bid, ask = min(candidates, key=lambda value: (value[0], value[1] < target_ns))
+        # The quote prevailing at the requested instant is the latest quote at
+        # or before that instant. Using a later quote would leak future price
+        # information into the recorded entry or expiry result.
+        quotes_at_or_before = [value for value in candidates if value[1] <= target_ns]
+        if quotes_at_or_before:
+            _, timestamp_ns, bid, ask = max(quotes_at_or_before, key=lambda value: value[1])
+        else:
+            _, timestamp_ns, bid, ask = min(candidates, key=lambda value: value[1])
         if phase == "entry":
             execution_price = ask if signal == "BUY" else bid
         else:
@@ -469,6 +519,68 @@ def get_real_quote(symbol: str, target_dt: datetime, signal: str, phase: str) ->
     except Exception as error:
         logger.warning("REAL QUOTE FAILED %s %s: %s", symbol, phase, error)
         return None
+
+
+def get_current_market_quote(symbol: str) -> dict | None:
+    cached = live_quote_cache.get(symbol)
+    now_monotonic = time.monotonic()
+    if cached and now_monotonic - cached[0] <= LIVE_QUOTE_CACHE_SECONDS:
+        return dict(cached[1])
+
+    pair = symbol.replace("=X", "").replace("-", "")
+    if not MARKET_DATA_API_KEY or len(pair) != 6:
+        return None
+
+    quote = None
+    try:
+        response = requests.get(
+            f"{MARKET_DATA_BASE_URL}/v1/last_quote/currencies/{pair[:3]}/{pair[3:]}",
+            params={"apiKey": MARKET_DATA_API_KEY},
+            timeout=10,
+        )
+        response.raise_for_status()
+        last = response.json().get("last") or {}
+        bid = safe_float(last.get("bid"))
+        ask = safe_float(last.get("ask"))
+        timestamp_ms = last.get("timestamp")
+        if bid is not None and ask is not None and timestamp_ms is not None and bid > 0 and ask >= bid:
+            quote_time = datetime.fromtimestamp(float(timestamp_ms) / 1000, tz=timezone.utc)
+            age_seconds = abs((datetime.now(timezone.utc) - quote_time).total_seconds())
+            if age_seconds <= LIVE_QUOTE_MAX_AGE_SECONDS:
+                quote = {
+                    "price": round(ask, 5),
+                    "bid": round(bid, 5),
+                    "ask": round(ask, 5),
+                    "spread": round(ask - bid, 5),
+                    "timestamp_iso": quote_time.isoformat(),
+                    "provider": f"{MARKET_DATA_PROVIDER}_last_quote",
+                }
+            else:
+                logger.info("STALE LIVE QUOTE %s age_seconds=%.1f", symbol, age_seconds)
+    except Exception as error:
+        logger.warning("LAST QUOTE FAILED %s: %s", symbol, error)
+
+    # Some plans may not expose the dedicated last-quote endpoint. Fall back to
+    # the closest BBO quote only when it is still fresh enough to be called live.
+    if quote is None:
+        quote = get_real_quote(symbol, datetime.now(timezone.utc), "BUY", "entry")
+        if quote is not None:
+            try:
+                quote_time = parse_iso_utc(quote["timestamp_iso"])
+                age_seconds = abs((datetime.now(timezone.utc) - quote_time).total_seconds())
+                if age_seconds > LIVE_QUOTE_MAX_AGE_SECONDS:
+                    logger.info("STALE FALLBACK QUOTE %s age_seconds=%.1f", symbol, age_seconds)
+                    quote = None
+            except Exception:
+                quote = None
+
+    if quote is None:
+        return None
+
+    quote = dict(quote)
+    quote["mid"] = round((quote["bid"] + quote["ask"]) / 2, 5)
+    live_quote_cache[symbol] = (now_monotonic, quote)
+    return dict(quote)
 
 
 def get_latest_exit_price_for_item(item: dict) -> float | None:
@@ -510,6 +622,7 @@ def finalize_closed_signal(
 
     if entry_price is None or signal not in ("BUY", "SELL") or not has_real_entry(item):
         item["result"] = "WAITING_RESULT"
+        item["outcome"] = None
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
@@ -520,6 +633,7 @@ def finalize_closed_signal(
         entry_price = float(entry_price)
     except Exception:
         item["result"] = "WAITING_RESULT"
+        item["outcome"] = None
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
@@ -531,6 +645,7 @@ def finalize_closed_signal(
 
     if exit_price is None:
         item["result"] = "WAITING_RESULT"
+        item["outcome"] = None
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
@@ -541,6 +656,7 @@ def finalize_closed_signal(
         exit_price = float(exit_price)
     except Exception:
         item["result"] = "WAITING_RESULT"
+        item["outcome"] = None
         item["exit_price"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
@@ -551,6 +667,7 @@ def finalize_closed_signal(
 
     if not has_real_exit(item):
         item["result"] = "WAITING_RESULT"
+        item["outcome"] = None
         item["profit_value"] = None
         item["profit_percent"] = None
         item["last_fact_retry_iso"] = now_iso()
@@ -567,124 +684,152 @@ def finalize_closed_signal(
 
     item["profit_value"] = round(profit_value, 5)
     item["profit_percent"] = round(profit_percent, 3)
+    item["outcome"] = "WIN" if profit_value >= 0 else "LOSS"
 
     return item
 
 
-def apply_multitimeframe_confirmation(item: dict) -> dict:
-    confirm_bias = item.get("confirm_bias")
-    trend_bias = item.get("trend_bias")
+def calculate_experience_adjustment(item: dict) -> dict:
+    """Return a conservative, past-only strategy adjustment.
+
+    The Bayesian prior contributes an equal number of virtual wins and losses,
+    preventing a short lucky streak from dominating a forecast. Only records
+    with verified executable entry and exit quotes are eligible.
+    """
     signal = item.get("signal")
-    confidence = item.get("confidence", 50)
+    strategy_names = {
+        str(strategy.get("name"))
+        for strategy in item.get("strategy_signals", [])
+        if strategy.get("signal") == signal and strategy.get("name")
+    }
+    if not strategy_names:
+        return {"factor": 1.0, "samples": 0, "posterior_win_rate": None}
 
-    if signal == confirm_bias == trend_bias:
-        confidence *= 1.25
-    elif signal == confirm_bias:
-        confidence *= 1.1
-    else:
-        confidence *= 0.85
+    wins = 0
+    losses = 0
+    for historical in signal_history:
+        if not has_verified_execution(historical) or not has_verified_analysis(historical):
+            continue
+        if historical.get("timeframe") != item.get("timeframe"):
+            continue
+        if historical.get("duration_type") != item.get("duration_type"):
+            continue
+        if (
+            item.get("market_regime")
+            and historical.get("market_regime")
+            and historical.get("market_regime") != item.get("market_regime")
+        ):
+            continue
 
-    item["confidence"] = round(confidence, 1)
+        historical_names = {
+            str(strategy.get("name"))
+            for strategy in historical.get("strategy_signals", [])
+            if strategy.get("name")
+        }
+        if not strategy_names.intersection(historical_names):
+            continue
+
+        outcome = historical.get("outcome")
+        if outcome == "WIN" or (outcome is None and historical.get("result") == "TP"):
+            wins += 1
+        elif outcome == "LOSS" or (outcome is None and historical.get("result") == "SL"):
+            losses += 1
+
+    samples = wins + losses
+    if samples < EXPERIENCE_MIN_SAMPLES:
+        return {"factor": 1.0, "samples": samples, "posterior_win_rate": None}
+
+    prior_wins = EXPERIENCE_PRIOR_SAMPLES / 2
+    posterior_win_rate = (wins + prior_wins) / (samples + EXPERIENCE_PRIOR_SAMPLES)
+    raw_adjustment = (posterior_win_rate - 0.5) * 0.5
+    bounded_adjustment = max(
+        -EXPERIENCE_MAX_ADJUSTMENT,
+        min(EXPERIENCE_MAX_ADJUSTMENT, raw_adjustment),
+    )
+    return {
+        "factor": round(1.0 + bounded_adjustment, 4),
+        "samples": samples,
+        "posterior_win_rate": round(posterior_win_rate, 4),
+    }
+
+
+def apply_news_context(item: dict, context: dict) -> dict:
+    """Use news only as a bounded confirmation; never create or flip a signal."""
+    item = dict(item)
+    status = str(context.get("status") or "disabled")
+    news_score = safe_float(context.get("score")) or 0.0
+    signal = item.get("signal")
+    adjustment = 0.0
+
+    if status == "ok" and signal in ("BUY", "SELL"):
+        directional_support = news_score if signal == "BUY" else -news_score
+        adjustment = max(
+            -NEWS_MAX_CONFIDENCE_ADJUSTMENT,
+            min(NEWS_MAX_CONFIDENCE_ADJUSTMENT, directional_support * NEWS_MAX_CONFIDENCE_ADJUSTMENT),
+        )
+        confidence = safe_float(item.get("confidence")) or 0.0
+        item["confidence"] = round(max(0.0, min(90.0, confidence + adjustment)), 1)
+
+        if abs(news_score) >= 0.08:
+            relation = "подтверждают" if directional_support > 0 else "противоречат"
+            suffix = f"Новости {relation} направлению ({news_score:+.2f})"
+            current_reason = str(item.get("reason") or "").strip()
+            item["reason"] = f"{current_reason}; {suffix}" if current_reason else suffix
+
+    item["news_status"] = status
+    item["news_provider"] = context.get("provider")
+    item["news_score"] = round(news_score, 4)
+    item["news_direction"] = context.get("direction") or "NEUTRAL"
+    item["news_article_count"] = int(context.get("article_count") or 0)
+    item["news_items"] = context.get("items") or []
+    item["news_updated_at_iso"] = context.get("updated_at_iso")
+    item["news_confidence_adjustment"] = round(adjustment, 2)
     return item
-
-
-def apply_volatility_filter(item: dict) -> dict:
-    volatility = item.get("volatility_ratio")
-    if volatility is None:
-        return item
-
-    confidence = item.get("confidence", 50)
-
-    if volatility < 0.7:
-        confidence *= 0.7
-    elif 0.8 <= volatility <= 1.2:
-        confidence *= 1.15
-    elif volatility > 1.5:
-        confidence *= 0.85
-
-    item["confidence"] = round(confidence, 1)
-    return item
-
-
-def apply_market_regime_bonus(item: dict) -> dict:
-    regime = item.get("market_regime")
-    strategy = item.get("strategy")
-    confidence = item.get("confidence", 50)
-
-    strategy_text = str(strategy).lower()
-
-    if regime == "TREND" and "trend" in strategy_text:
-        confidence *= 1.2
-    elif regime == "RANGE" and "rsi" in strategy_text:
-        confidence *= 1.2
-    elif regime == "VOLATILE" and "breakout" in strategy_text:
-        confidence *= 1.2
-    else:
-        confidence *= 0.9
-
-    item["confidence"] = round(confidence, 1)
-    return item
-
-
-def calculate_strategy_stats() -> dict:
-    stats = {}
-
-    for item in signal_history:
-        if not has_verified_execution(item):
-            continue
-
-        strategy = item.get("strategy")
-        if not strategy:
-            continue
-
-        result = item.get("result")
-        if result not in ("TP", "SL"):
-            continue
-
-        if strategy not in stats:
-            stats[strategy] = {"tp": 0, "sl": 0}
-
-        if result == "TP":
-            stats[strategy]["tp"] += 1
-        else:
-            stats[strategy]["sl"] += 1
-
-    winrate = {}
-
-    for strategy, data in stats.items():
-        total = data["tp"] + data["sl"]
-        if total == 0:
-            continue
-        winrate[strategy] = data["tp"] / total
-
-    return winrate
 
 
 def add_signals_to_active(items: list[dict]) -> None:
     global active_signals
 
-    stats = calculate_strategy_stats()
     existing_keys = {make_signal_key(s) for s in active_signals}
 
     for item in items:
-        item = apply_market_regime_bonus(item)
-        item = apply_multitimeframe_confirmation(item)
-        item = apply_volatility_filter(item)
-
-        strategy = item.get("strategy")
-        if strategy in stats:
-            winrate = stats[strategy]
-            item["confidence"] = round(item.get("confidence", 50) * (0.5 + winrate), 1)
-
+        experience = calculate_experience_adjustment(item)
         try:
             confidence_value = float(item.get("confidence", 50) or 50)
         except Exception:
             confidence_value = 50.0
 
-        item["confidence"] = round(max(1.0, min(95.0, confidence_value)), 1)
+        confidence_value *= experience["factor"]
+        item["confidence"] = round(max(1.0, min(90.0, confidence_value)), 1)
+        item["experience_samples"] = experience["samples"]
+        item["experience_win_rate"] = experience["posterior_win_rate"]
+        item["experience_factor"] = experience["factor"]
 
         signal = item.get("signal")
         if signal not in ("BUY", "SELL"):
+            continue
+
+        analysis_source = str(item.get("analysis_data_source") or "")
+        if REQUIRE_REAL_ANALYSIS_SOURCE and analysis_source not in REAL_ANALYSIS_SOURCES:
+            logger.info(
+                "SIGNAL FILTERED BY DATA SOURCE: %s %s source=%s",
+                item.get("symbol"),
+                item.get("timeframe"),
+                analysis_source,
+            )
+            continue
+
+        if (
+            item.get("live_bid") is None
+            or item.get("live_ask") is None
+            or not item.get("live_quote_time_iso")
+            or not item.get("price_source")
+        ):
+            logger.info(
+                "SIGNAL FILTERED BY MISSING LIVE QUOTE: %s %s",
+                item.get("symbol"),
+                item.get("timeframe"),
+            )
             continue
 
         volatility = item.get("volatility_ratio")
@@ -753,6 +898,7 @@ def add_signals_to_active(items: list[dict]) -> None:
                 "status": "active",
                 "closed_at_iso": None,
                 "result": "OPEN",
+                "outcome": None,
             }
         )
 
@@ -956,6 +1102,34 @@ async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -
         if not isinstance(result, dict):
             return make_error_payload(symbol, "Некорректный ответ анализа")
 
+        indicator_price = safe_float(result.get("price"))
+        result["indicator_price"] = indicator_price
+        live_quote = await asyncio.to_thread(get_current_market_quote, symbol)
+        if live_quote is not None:
+            live_mid = live_quote["mid"]
+            old_tp = safe_float(result.get("tp"))
+            old_sl = safe_float(result.get("sl"))
+            if indicator_price is not None:
+                if old_tp is not None:
+                    result["tp"] = round(live_mid + (old_tp - indicator_price), 5)
+                if old_sl is not None:
+                    result["sl"] = round(live_mid + (old_sl - indicator_price), 5)
+            result["price"] = live_mid
+            result["live_bid"] = live_quote["bid"]
+            result["live_ask"] = live_quote["ask"]
+            result["live_spread"] = live_quote["spread"]
+            result["live_quote_time_iso"] = live_quote["timestamp_iso"]
+            result["price_source"] = live_quote["provider"]
+        else:
+            result["live_bid"] = None
+            result["live_ask"] = None
+            result["live_spread"] = None
+            result["live_quote_time_iso"] = None
+            result["price_source"] = None
+
+        news_context = await asyncio.to_thread(get_news_context, symbol)
+        result = apply_news_context(result, news_context)
+
         return result
 
     except Exception as e:
@@ -1070,6 +1244,7 @@ async def lifespan(app: FastAPI):
         signal_history.clear()
 
     deduplicate_active_signals()
+    prune_legacy_active_signals()
     deduplicate_signal_history()
 
     try:
@@ -1097,6 +1272,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="AutoSignal API", lifespan=lifespan)
 
 
+def public_signal_settings() -> dict:
+    return {
+        "min_confidence": MIN_CONFIDENCE_TO_KEEP,
+        "min_volatility_ratio": MIN_VOLATILITY_RATIO,
+        "require_bias_match": REQUIRE_AT_LEAST_ONE_BIAS_MATCH,
+        "require_real_analysis_source": REQUIRE_REAL_ANALYSIS_SOURCE,
+        "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
+        "experience_min_samples": EXPERIENCE_MIN_SAMPLES,
+        "experience_prior_samples": EXPERIENCE_PRIOR_SAMPLES,
+        "experience_max_adjustment": EXPERIENCE_MAX_ADJUSTMENT,
+        "news_max_confidence_adjustment": NEWS_MAX_CONFIDENCE_ADJUSTMENT,
+        "news": news_settings(),
+        "confidence_type": "heuristic_signal_strength",
+    }
+
+
 @app.get("/")
 def root():
     return {
@@ -1111,7 +1302,13 @@ def root():
         "last_refresh_status": last_refresh_status,
         "active_expire_grace_seconds": ACTIVE_EXPIRE_GRACE_SECONDS,
         "analyze_concurrency": ANALYZE_CONCURRENCY,
+        "signal_settings": public_signal_settings(),
     }
+
+
+@app.get("/settings")
+def get_settings():
+    return public_signal_settings()
 
 
 @app.get("/health")
