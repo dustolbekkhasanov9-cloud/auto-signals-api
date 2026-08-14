@@ -28,6 +28,14 @@ _inflight: dict[str, threading.Event] = {}
 _lock = threading.Lock()
 
 
+def _request_error_summary(error: Exception) -> str:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        return f"{type(error).__name__} status={status_code}"
+    return type(error).__name__
+
+
 def news_settings() -> dict[str, Any]:
     return {
         "enabled": NEWS_ENABLED,
@@ -207,8 +215,9 @@ def get_news_context(symbol: str) -> dict[str, Any]:
             else:
                 result = _build_context(symbol, payload.get("feed") or [])
     except Exception as error:
-        logger.warning("NEWS CONTEXT FAILED %s: %s", symbol, error)
-        result = _empty_context(symbol, "error", str(error)[:300])
+        summary = _request_error_summary(error)
+        logger.warning("NEWS CONTEXT FAILED %s: %s", symbol, summary)
+        result = _empty_context(symbol, "error", summary)
     finally:
         with _lock:
             _cache[symbol] = (time.monotonic(), result)

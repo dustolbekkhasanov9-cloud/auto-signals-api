@@ -23,9 +23,11 @@ MARKET_DATA_BASE_URL = os.environ.get(
 )
 MARKET_DATA_PROVIDER = "massive" if MASSIVE_API_KEY else "polygon"
 DATA_CACHE_TTL_SECONDS = 30
+MARKET_DATA_BACKOFF_SECONDS = int(os.environ.get("MARKET_DATA_BACKOFF_SECONDS", "300"))
 
 _data_cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
 _data_cache_lock = threading.Lock()
+_market_data_forbidden_until = 0.0
 
 DEFAULT_TIMEFRAME = "1h"
 MULTI_TIMEFRAME_MAP = {
@@ -155,6 +157,22 @@ def normalize_duration_type(duration_type: str | None) -> str:
     return DEFAULT_DURATION_TYPE
 
 
+def request_error_summary(error: Exception) -> str:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        return f"{type(error).__name__} status={status_code}"
+    return type(error).__name__
+
+
+def record_market_data_failure(error: Exception) -> None:
+    global _market_data_forbidden_until
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in (401, 403, 429):
+        _market_data_forbidden_until = time.monotonic() + MARKET_DATA_BACKOFF_SECONDS
+
+
 def period_to_days(period: str) -> int:
     if period.endswith("d"):
         return max(int(period[:-1]), 1)
@@ -190,7 +208,7 @@ def _fetch_market_aggregates(
     timeframe: str,
     days: int,
 ) -> pd.DataFrame | None:
-    if not MARKET_DATA_API_KEY:
+    if not MARKET_DATA_API_KEY or time.monotonic() < _market_data_forbidden_until:
         return None
 
     multiplier, timespan = MARKET_AGG_CONFIG[timeframe]
@@ -338,7 +356,13 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
         if market_df is not None and not market_df.empty:
             return _cache_market_data(symbol, timeframe, market_df)
     except Exception as error:
-        logger.warning("MARKET AGGREGATES FAILED %s %s: %s", symbol, timeframe, error)
+        record_market_data_failure(error)
+        logger.warning(
+            "MARKET AGGREGATES FAILED %s %s: %s",
+            symbol,
+            timeframe,
+            request_error_summary(error),
+        )
 
     fallback_df = _fetch_yahoo_data(symbol, timeframe, days)
     if fallback_df is not None and not fallback_df.empty:

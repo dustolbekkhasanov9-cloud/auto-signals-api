@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict
 
@@ -78,14 +79,16 @@ REQUIRE_AT_LEAST_ONE_BIAS_MATCH = os.environ.get(
     "REQUIRE_AT_LEAST_ONE_BIAS_MATCH", "true"
 ).lower() == "true"
 REQUIRE_REAL_ANALYSIS_SOURCE = os.environ.get(
-    "REQUIRE_REAL_ANALYSIS_SOURCE", "true"
+    "REQUIRE_REAL_ANALYSIS_SOURCE", "false"
 ).lower() == "true"
-LIVE_QUOTE_CACHE_SECONDS = 5
+LIVE_QUOTE_CACHE_SECONDS = 30
 LIVE_QUOTE_MAX_AGE_SECONDS = int(os.environ.get("LIVE_QUOTE_MAX_AGE_SECONDS", "60"))
+MARKET_DATA_BACKOFF_SECONDS = int(os.environ.get("MARKET_DATA_BACKOFF_SECONDS", "300"))
 EXPERIENCE_MIN_SAMPLES = int(os.environ.get("EXPERIENCE_MIN_SAMPLES", "30"))
 EXPERIENCE_PRIOR_SAMPLES = float(os.environ.get("EXPERIENCE_PRIOR_SAMPLES", "20"))
 EXPERIENCE_MAX_ADJUSTMENT = float(os.environ.get("EXPERIENCE_MAX_ADJUSTMENT", "0.10"))
 REAL_ANALYSIS_SOURCES = {"massive_aggregates", "polygon_aggregates"}
+ALLOWED_ANALYSIS_SOURCES = REAL_ANALYSIS_SOURCES | {"yahoo_fallback", "yfinance_fallback"}
 NEWS_MAX_CONFIDENCE_ADJUSTMENT = float(
     os.environ.get("NEWS_MAX_CONFIDENCE_ADJUSTMENT", "5")
 )
@@ -100,6 +103,8 @@ signal_history: list[dict] = []
 
 refresh_lock = asyncio.Lock()
 live_quote_cache: Dict[str, tuple[float, dict]] = {}
+live_quote_locks: Dict[str, threading.Lock] = {}
+market_data_forbidden_until = 0.0
 
 
 def parse_iso_utc(value: str) -> datetime:
@@ -359,7 +364,7 @@ def prune_legacy_active_signals() -> int:
     active_signals = [
         item
         for item in active_signals
-        if item.get("analysis_data_source") in REAL_ANALYSIS_SOURCES
+        if item.get("analysis_data_source") in ALLOWED_ANALYSIS_SOURCES
         and item.get("confidence_type") == "heuristic_signal_strength"
         and item.get("price_source")
         and item.get("live_quote_time_iso")
@@ -408,6 +413,26 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def request_error_summary(error: Exception) -> str:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        return f"{type(error).__name__} status={status_code}"
+    return type(error).__name__
+
+
+def market_data_provider_available() -> bool:
+    return bool(MARKET_DATA_API_KEY) and time.monotonic() >= market_data_forbidden_until
+
+
+def record_market_data_failure(error: Exception) -> None:
+    global market_data_forbidden_until
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in (401, 403, 429):
+        market_data_forbidden_until = time.monotonic() + MARKET_DATA_BACKOFF_SECONDS
+
+
 def has_real_entry(item: dict) -> bool:
     return (
         safe_float(item.get("entry_price")) is not None
@@ -430,9 +455,49 @@ def has_verified_execution(item: dict) -> bool:
 
 def has_verified_analysis(item: dict) -> bool:
     return (
-        item.get("analysis_data_source") in REAL_ANALYSIS_SOURCES
+        item.get("analysis_data_source") in ALLOWED_ANALYSIS_SOURCES
         and item.get("confidence_type") == "heuristic_signal_strength"
     )
+
+
+def get_yahoo_live_snapshot(symbol: str, target_dt: datetime) -> dict | None:
+    """Return Yahoo's current market snapshot, never a candle close."""
+    now_utc = datetime.now(timezone.utc)
+    if abs((now_utc - target_dt).total_seconds()) > LIVE_QUOTE_MAX_AGE_SECONDS:
+        return None
+
+    try:
+        response = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+            params={"interval": "1m", "range": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        result = response.json()["chart"]["result"][0]
+        meta = result.get("meta") or {}
+        price = safe_float(meta.get("regularMarketPrice"))
+        timestamp = meta.get("regularMarketTime")
+        if price is None or price <= 0 or timestamp is None:
+            return None
+
+        quote_time = datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+        if abs((now_utc - quote_time).total_seconds()) > LIVE_QUOTE_MAX_AGE_SECONDS:
+            return None
+
+        return {
+            "price": round(price, 5),
+            "mid": round(price, 5),
+            "bid": None,
+            "ask": None,
+            "spread": None,
+            "timestamp_iso": quote_time.isoformat(),
+            "provider": "yahoo_snapshot",
+            "quote_kind": "live_mid_snapshot",
+        }
+    except Exception as error:
+        logger.warning("YAHOO SNAPSHOT FAILED %s: %s", symbol, request_error_summary(error))
+        return None
 
 
 def parse_chart_label_to_utc(label: Any) -> datetime | None:
@@ -457,8 +522,11 @@ def parse_chart_label_to_utc(label: Any) -> datetime | None:
 
 def get_real_quote(symbol: str, target_dt: datetime, signal: str, phase: str) -> dict | None:
     """Return an executable forex Bid/Ask close to target_dt, never a candle price."""
-    if not MARKET_DATA_API_KEY or signal not in ("BUY", "SELL"):
+    if signal not in ("BUY", "SELL"):
         return None
+
+    if not market_data_provider_available():
+        return get_yahoo_live_snapshot(symbol, target_dt)
 
     pair = symbol.replace("=X", "").replace("-", "")
     ticker = f"C:{pair}"
@@ -493,7 +561,7 @@ def get_real_quote(symbol: str, target_dt: datetime, signal: str, phase: str) ->
                 candidates.append((distance_ns, int(timestamp_ns), bid, ask))
 
         if not candidates:
-            return None
+            return get_yahoo_live_snapshot(symbol, target_dt)
 
         # The quote prevailing at the requested instant is the latest quote at
         # or before that instant. Using a later quote would leak future price
@@ -515,10 +583,12 @@ def get_real_quote(symbol: str, target_dt: datetime, signal: str, phase: str) ->
             "spread": round(ask - bid, 5),
             "timestamp_iso": datetime.fromtimestamp(timestamp_ns / 1_000_000_000, tz=timezone.utc).isoformat(),
             "provider": MARKET_DATA_PROVIDER,
+            "quote_kind": "executable_bbo",
         }
     except Exception as error:
-        logger.warning("REAL QUOTE FAILED %s %s: %s", symbol, phase, error)
-        return None
+        record_market_data_failure(error)
+        logger.warning("REAL QUOTE FAILED %s %s: %s", symbol, phase, request_error_summary(error))
+        return get_yahoo_live_snapshot(symbol, target_dt)
 
 
 def get_current_market_quote(symbol: str) -> dict | None:
@@ -527,9 +597,25 @@ def get_current_market_quote(symbol: str) -> dict | None:
     if cached and now_monotonic - cached[0] <= LIVE_QUOTE_CACHE_SECONDS:
         return dict(cached[1])
 
+    quote_lock = live_quote_locks.setdefault(symbol, threading.Lock())
+    with quote_lock:
+        cached = live_quote_cache.get(symbol)
+        now_monotonic = time.monotonic()
+        if cached and now_monotonic - cached[0] <= LIVE_QUOTE_CACHE_SECONDS:
+            return dict(cached[1])
+
+        return _fetch_current_market_quote(symbol, now_monotonic)
+
+
+def _fetch_current_market_quote(symbol: str, now_monotonic: float) -> dict | None:
     pair = symbol.replace("=X", "").replace("-", "")
-    if not MARKET_DATA_API_KEY or len(pair) != 6:
+    if len(pair) != 6:
         return None
+    if not market_data_provider_available():
+        quote = get_yahoo_live_snapshot(symbol, datetime.now(timezone.utc))
+        if quote is not None:
+            live_quote_cache[symbol] = (now_monotonic, quote)
+        return quote
 
     quote = None
     try:
@@ -554,11 +640,13 @@ def get_current_market_quote(symbol: str) -> dict | None:
                     "spread": round(ask - bid, 5),
                     "timestamp_iso": quote_time.isoformat(),
                     "provider": f"{MARKET_DATA_PROVIDER}_last_quote",
+                    "quote_kind": "executable_bbo",
                 }
             else:
                 logger.info("STALE LIVE QUOTE %s age_seconds=%.1f", symbol, age_seconds)
     except Exception as error:
-        logger.warning("LAST QUOTE FAILED %s: %s", symbol, error)
+        record_market_data_failure(error)
+        logger.warning("LAST QUOTE FAILED %s: %s", symbol, request_error_summary(error))
 
     # Some plans may not expose the dedicated last-quote endpoint. Fall back to
     # the closest BBO quote only when it is still fresh enough to be called live.
@@ -578,7 +666,8 @@ def get_current_market_quote(symbol: str) -> dict | None:
         return None
 
     quote = dict(quote)
-    quote["mid"] = round((quote["bid"] + quote["ask"]) / 2, 5)
+    if quote.get("mid") is None:
+        quote["mid"] = round((quote["bid"] + quote["ask"]) / 2, 5)
     live_quote_cache[symbol] = (now_monotonic, quote)
     return dict(quote)
 
@@ -604,6 +693,7 @@ def get_latest_exit_price_for_item(item: dict) -> float | None:
     item["exit_spread"] = quote["spread"]
     item["exit_quote_time_iso"] = quote["timestamp_iso"]
     item["exit_price_source"] = quote["provider"]
+    item["exit_quote_kind"] = quote.get("quote_kind")
     return quote["price"]
 
 
@@ -685,6 +775,13 @@ def finalize_closed_signal(
     item["profit_value"] = round(profit_value, 5)
     item["profit_percent"] = round(profit_percent, 3)
     item["outcome"] = "WIN" if profit_value >= 0 else "LOSS"
+    entry_kind = item.get("entry_quote_kind")
+    exit_kind = item.get("exit_quote_kind")
+    item["outcome_quality"] = (
+        "executable_bbo"
+        if entry_kind == exit_kind == "executable_bbo"
+        else "live_mid_snapshot"
+    )
 
     return item
 
@@ -810,6 +907,14 @@ def add_signals_to_active(items: list[dict]) -> None:
             continue
 
         analysis_source = str(item.get("analysis_data_source") or "")
+        if analysis_source not in ALLOWED_ANALYSIS_SOURCES:
+            logger.info(
+                "SIGNAL FILTERED BY UNKNOWN DATA SOURCE: %s %s source=%s",
+                item.get("symbol"),
+                item.get("timeframe"),
+                analysis_source,
+            )
+            continue
         if REQUIRE_REAL_ANALYSIS_SOURCE and analysis_source not in REAL_ANALYSIS_SOURCES:
             logger.info(
                 "SIGNAL FILTERED BY DATA SOURCE: %s %s source=%s",
@@ -820,10 +925,10 @@ def add_signals_to_active(items: list[dict]) -> None:
             continue
 
         if (
-            item.get("live_bid") is None
-            or item.get("live_ask") is None
+            item.get("price") is None
             or not item.get("live_quote_time_iso")
             or not item.get("price_source")
+            or not item.get("live_quote_kind")
         ):
             logger.info(
                 "SIGNAL FILTERED BY MISSING LIVE QUOTE: %s %s",
@@ -895,6 +1000,7 @@ def add_signals_to_active(items: list[dict]) -> None:
                 "entry_spread": None,
                 "entry_quote_time_iso": None,
                 "entry_price_source": None,
+                "entry_quote_kind": None,
                 "status": "active",
                 "closed_at_iso": None,
                 "result": "OPEN",
@@ -931,6 +1037,7 @@ def capture_due_entry_prices() -> bool:
         item["entry_spread"] = quote["spread"]
         item["entry_quote_time_iso"] = quote["timestamp_iso"]
         item["entry_price_source"] = quote["provider"]
+        item["entry_quote_kind"] = quote.get("quote_kind")
 
         analysis_price = safe_float(item.get("analysis_price")) or safe_float(item.get("price"))
         old_tp = safe_float(item.get("tp"))
@@ -1120,12 +1227,14 @@ async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -
             result["live_spread"] = live_quote["spread"]
             result["live_quote_time_iso"] = live_quote["timestamp_iso"]
             result["price_source"] = live_quote["provider"]
+            result["live_quote_kind"] = live_quote.get("quote_kind")
         else:
             result["live_bid"] = None
             result["live_ask"] = None
             result["live_spread"] = None
             result["live_quote_time_iso"] = None
             result["price_source"] = None
+            result["live_quote_kind"] = None
 
         news_context = await asyncio.to_thread(get_news_context, symbol)
         result = apply_news_context(result, news_context)
@@ -1278,7 +1387,9 @@ def public_signal_settings() -> dict:
         "min_volatility_ratio": MIN_VOLATILITY_RATIO,
         "require_bias_match": REQUIRE_AT_LEAST_ONE_BIAS_MATCH,
         "require_real_analysis_source": REQUIRE_REAL_ANALYSIS_SOURCE,
+        "allowed_analysis_sources": sorted(ALLOWED_ANALYSIS_SOURCES),
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
+        "market_data_backoff_seconds": MARKET_DATA_BACKOFF_SECONDS,
         "experience_min_samples": EXPERIENCE_MIN_SAMPLES,
         "experience_prior_samples": EXPERIENCE_PRIOR_SAMPLES,
         "experience_max_adjustment": EXPERIENCE_MAX_ADJUSTMENT,
