@@ -1255,7 +1255,9 @@ def analyze_symbol(
         exit_time_iso = exit_dt_utc.isoformat().replace("+00:00", "Z")
         recommended_expiry = format_expiry_label(expiry_delta)
 
-        entry_price = round(float(chart_df["Close"].iloc[-1]), 5) if not chart_df.empty else round(price, 5)
+        # The executable entry price is captured from a real Bid/Ask quote by api.py
+        # when entry_time is reached. Candle close is analysis data only.
+        entry_price = None
 
         rr_multiplier = 1.8 if duration_type == "short" else 2.2
         sl_multiplier = 1.0 if duration_type == "short" else 1.2

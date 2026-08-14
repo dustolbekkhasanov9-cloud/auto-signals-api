@@ -1,6 +1,16 @@
-from news_feed import build_feed
+try:
+    from news_feed import build_feed
+except ImportError:
+    def build_feed() -> dict:
+        return {
+            "hero": None,
+            "top_news": [],
+            "forex_news": [],
+            "market_pulse": [],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import asyncio
 import json
 import logging
@@ -9,6 +19,7 @@ import time
 from typing import Any, Dict
 
 import psycopg2
+import requests
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Query
 
@@ -19,9 +30,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autosignal-api")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+MARKET_DATA_API_KEY = MASSIVE_API_KEY or POLYGON_API_KEY
+MARKET_DATA_BASE_URL = os.environ.get(
+    "MARKET_DATA_BASE_URL",
+    "https://api.massive.com" if MASSIVE_API_KEY else "https://api.polygon.io",
+)
+MARKET_DATA_PROVIDER = "massive" if MASSIVE_API_KEY else "polygon"
 
 if not DATABASE_URL:
     logger.warning("DATABASE_URL not set")
+
+if not MARKET_DATA_API_KEY:
+    logger.warning("No real-time market data API key set (MASSIVE_API_KEY or POLYGON_API_KEY)")
 
 
 DEFAULT_SYMBOLS = [
@@ -350,6 +372,26 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def has_real_entry(item: dict) -> bool:
+    return (
+        safe_float(item.get("entry_price")) is not None
+        and bool(item.get("entry_price_source"))
+        and bool(item.get("entry_quote_time_iso"))
+    )
+
+
+def has_real_exit(item: dict) -> bool:
+    return (
+        safe_float(item.get("exit_price")) is not None
+        and bool(item.get("exit_price_source"))
+        and bool(item.get("exit_quote_time_iso"))
+    )
+
+
+def has_verified_execution(item: dict) -> bool:
+    return has_real_entry(item) and has_real_exit(item)
+
+
 def parse_chart_label_to_utc(label: Any) -> datetime | None:
     if not label:
         return None
@@ -370,9 +412,70 @@ def parse_chart_label_to_utc(label: Any) -> datetime | None:
     return None
 
 
-def get_exit_price_from_chart(item: dict) -> float | None:
+def get_real_quote(symbol: str, target_dt: datetime, signal: str, phase: str) -> dict | None:
+    """Return an executable forex Bid/Ask close to target_dt, never a candle price."""
+    if not MARKET_DATA_API_KEY or signal not in ("BUY", "SELL"):
+        return None
+
+    pair = symbol.replace("=X", "").replace("-", "")
+    ticker = f"C:{pair}"
+    window = timedelta(minutes=2)
+    target_ns = int(target_dt.timestamp() * 1_000_000_000)
+
+    try:
+        response = requests.get(
+            f"{MARKET_DATA_BASE_URL}/v3/quotes/{ticker}",
+            params={
+                "timestamp.gte": int((target_dt - window).timestamp() * 1_000_000_000),
+                "timestamp.lte": int((target_dt + window).timestamp() * 1_000_000_000),
+                "order": "asc",
+                "sort": "timestamp",
+                "limit": 50000,
+                "apiKey": MARKET_DATA_API_KEY,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        quotes = response.json().get("results", [])
+
+        candidates = []
+        for quote in quotes:
+            timestamp_ns = quote.get("participant_timestamp") or quote.get("sip_timestamp") or quote.get("t")
+            bid = safe_float(quote.get("bid_price"))
+            ask = safe_float(quote.get("ask_price"))
+            if timestamp_ns is None or bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+                continue
+            distance_ns = abs(int(timestamp_ns) - target_ns)
+            if distance_ns <= int(window.total_seconds() * 1_000_000_000):
+                candidates.append((distance_ns, int(timestamp_ns), bid, ask))
+
+        if not candidates:
+            return None
+
+        _, timestamp_ns, bid, ask = min(candidates, key=lambda value: (value[0], value[1] < target_ns))
+        if phase == "entry":
+            execution_price = ask if signal == "BUY" else bid
+        else:
+            execution_price = bid if signal == "BUY" else ask
+
+        return {
+            "price": round(execution_price, 5),
+            "bid": round(bid, 5),
+            "ask": round(ask, 5),
+            "spread": round(ask - bid, 5),
+            "timestamp_iso": datetime.fromtimestamp(timestamp_ns / 1_000_000_000, tz=timezone.utc).isoformat(),
+            "provider": MARKET_DATA_PROVIDER,
+        }
+    except Exception as error:
+        logger.warning("REAL QUOTE FAILED %s %s: %s", symbol, phase, error)
+        return None
+
+
+def get_latest_exit_price_for_item(item: dict) -> float | None:
     exit_time_iso = item.get("exit_time_iso")
-    if not exit_time_iso:
+    symbol = item.get("symbol")
+    signal = item.get("signal")
+    if not exit_time_iso or not symbol:
         return None
 
     try:
@@ -380,90 +483,16 @@ def get_exit_price_from_chart(item: dict) -> float | None:
     except Exception:
         return None
 
-    symbol = item.get("symbol")
-    timeframe = item.get("timeframe")
-    duration_type = item.get("duration_type")
+    quote = get_real_quote(symbol, exit_dt, signal, "exit")
+    if quote is None:
+        return None
 
-    candidates = []
-
-    if symbol and timeframe and duration_type:
-        cache_key = make_cache_key(symbol, timeframe, duration_type)
-        cached = scan_cache.get(cache_key)
-        if isinstance(cached, dict):
-            candidates.append(cached)
-
-    candidates.append(item)
-
-    best_future_price = None
-    best_future_dt = None
-
-    best_past_price = None
-    best_past_dt = None
-
-    for source in candidates:
-        labels = source.get("chart_labels")
-        prices = source.get("chart_prices")
-
-        if not isinstance(labels, list) or not isinstance(prices, list):
-            continue
-
-        if len(labels) == 0 or len(prices) == 0:
-            continue
-
-        for label, raw_price in zip(labels, prices):
-            candle_dt = parse_chart_label_to_utc(label)
-            price = safe_float(raw_price)
-
-            if candle_dt is None or price is None:
-                continue
-
-            if candle_dt >= exit_dt:
-                if best_future_dt is None or candle_dt < best_future_dt:
-                    best_future_dt = candle_dt
-                    best_future_price = price
-            else:
-                if best_past_dt is None or candle_dt > best_past_dt:
-                    best_past_dt = candle_dt
-                    best_past_price = price
-
-    if best_future_price is not None:
-        return round(best_future_price, 5)
-
-    if best_past_price is not None:
-        return round(best_past_price, 5)
-
-    return None
-
-
-def get_latest_exit_price_for_item(item: dict) -> float | None:
-    chart_exit_price = get_exit_price_from_chart(item)
-    if chart_exit_price is not None:
-        return chart_exit_price
-
-    symbol = item.get("symbol")
-    timeframe = item.get("timeframe")
-    duration_type = item.get("duration_type")
-
-    if symbol and timeframe and duration_type:
-        cache_key = make_cache_key(symbol, timeframe, duration_type)
-        cached = scan_cache.get(cache_key)
-
-        if isinstance(cached, dict):
-            price = safe_float(cached.get("price"))
-            if price is not None:
-                return round(price, 5)
-
-    price = safe_float(item.get("price"))
-    if price is not None:
-        return round(price, 5)
-
-    chart = item.get("chart_prices")
-    if isinstance(chart, list) and len(chart) > 0:
-        last_chart_price = safe_float(chart[-1])
-        if last_chart_price is not None:
-            return round(last_chart_price, 5)
-
-    return None
+    item["exit_bid"] = quote["bid"]
+    item["exit_ask"] = quote["ask"]
+    item["exit_spread"] = quote["spread"]
+    item["exit_quote_time_iso"] = quote["timestamp_iso"]
+    item["exit_price_source"] = quote["provider"]
+    return quote["price"]
 
 
 def finalize_closed_signal(
@@ -479,7 +508,7 @@ def finalize_closed_signal(
     entry_price = item.get("entry_price")
     signal = item.get("signal")
 
-    if entry_price is None or signal not in ("BUY", "SELL"):
+    if entry_price is None or signal not in ("BUY", "SELL") or not has_real_entry(item):
         item["result"] = "WAITING_RESULT"
         item["exit_price"] = None
         item["profit_value"] = None
@@ -519,6 +548,13 @@ def finalize_closed_signal(
         return item
 
     item["exit_price"] = round(exit_price, 5)
+
+    if not has_real_exit(item):
+        item["result"] = "WAITING_RESULT"
+        item["profit_value"] = None
+        item["profit_percent"] = None
+        item["last_fact_retry_iso"] = now_iso()
+        return item
 
     if signal == "BUY":
         profit_value = exit_price - entry_price
@@ -594,6 +630,9 @@ def calculate_strategy_stats() -> dict:
     stats = {}
 
     for item in signal_history:
+        if not has_verified_execution(item):
+            continue
+
         strategy = item.get("strategy")
         if not strategy:
             continue
@@ -704,6 +743,13 @@ def add_signals_to_active(items: list[dict]) -> None:
         active_signals.append(
             {
                 **item,
+                "analysis_price": item.get("price"),
+                "entry_price": None,
+                "entry_bid": None,
+                "entry_ask": None,
+                "entry_spread": None,
+                "entry_quote_time_iso": None,
+                "entry_price_source": None,
                 "status": "active",
                 "closed_at_iso": None,
                 "result": "OPEN",
@@ -711,6 +757,48 @@ def add_signals_to_active(items: list[dict]) -> None:
         )
 
         existing_keys.add(key)
+
+
+def capture_due_entry_prices() -> bool:
+    now_utc = datetime.now(timezone.utc)
+    changed = False
+
+    for item in active_signals:
+        if item.get("result") != "OPEN" or has_real_entry(item):
+            continue
+
+        try:
+            entry_dt = parse_iso_utc(item.get("entry_time_iso", ""))
+        except Exception:
+            continue
+
+        if now_utc < entry_dt:
+            continue
+
+        quote = get_real_quote(item.get("symbol", ""), entry_dt, item.get("signal", ""), "entry")
+        if quote is None:
+            continue
+
+        item["entry_price"] = quote["price"]
+        item["entry_bid"] = quote["bid"]
+        item["entry_ask"] = quote["ask"]
+        item["entry_spread"] = quote["spread"]
+        item["entry_quote_time_iso"] = quote["timestamp_iso"]
+        item["entry_price_source"] = quote["provider"]
+
+        analysis_price = safe_float(item.get("analysis_price")) or safe_float(item.get("price"))
+        old_tp = safe_float(item.get("tp"))
+        old_sl = safe_float(item.get("sl"))
+        if analysis_price is not None:
+            if old_tp is not None:
+                item["tp"] = round(quote["price"] + (old_tp - analysis_price), 5)
+            if old_sl is not None:
+                item["sl"] = round(quote["price"] + (old_sl - analysis_price), 5)
+        changed = True
+
+    if changed:
+        save_state()
+    return changed
 
 
 def update_closed_history_results() -> bool:
@@ -747,12 +835,12 @@ def update_closed_history_results() -> bool:
             continue
 
         exit_price = get_latest_exit_price_for_item(item)
-        close_reason = "exit_price_from_chart_or_cache"
+        close_reason = "real_bid_ask_quote"
 
         closed_item = finalize_closed_signal(
             item,
             exit_price=exit_price,
-            close_reason=close_reason if exit_price is not None else "exit_price_not_found",
+            close_reason=close_reason if exit_price is not None else "real_exit_quote_not_found",
         )
 
         if not history_duplicate_exists(closed_item):
@@ -848,6 +936,7 @@ def update_waiting_history_results() -> bool:
 
 def safe_reconcile_for_api(update_waiting: bool = False) -> None:
     try:
+        capture_due_entry_prices()
         update_closed_history_results()
         if update_waiting:
             update_waiting_history_results()
@@ -936,6 +1025,7 @@ async def refresh_all_signals() -> None:
 
             add_signals_to_active(all_results)
             deduplicate_active_signals()
+            capture_due_entry_prices()
             update_closed_history_results()
             update_waiting_history_results()
 
@@ -1196,8 +1286,14 @@ def get_history(limit: int = 500):
 
     history_items = [
         item for item in signal_history
-        if item.get("result") in ("WAITING_RESULT", "TP", "SL")
+        if (
+            item.get("result") == "WAITING_RESULT" and has_real_entry(item)
+        ) or (
+            item.get("result") in ("TP", "SL") and has_verified_execution(item)
+        )
     ]
+
+    legacy_items_count = len(signal_history) - len(history_items)
 
     def sort_dt(item: dict) -> datetime:
         value = (
@@ -1230,6 +1326,8 @@ def get_history(limit: int = 500):
         "count": len(ordered_items),
         "limit": limit,
         "last_updated_at": last_updated_at,
+        "verified_execution_only": True,
+        "legacy_items_excluded": legacy_items_count,
     }
 
 
