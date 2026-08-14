@@ -1079,11 +1079,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.exception("Ошибка подготовки состояния: %s", e)
 
-    try:
-        await refresh_all_signals()
-    except Exception as e:
-        logger.exception("Ошибка стартового прогрева: %s", e)
-
+    # Do not block the ASGI startup on 64 network-heavy analyses. Render needs
+    # the port to open quickly; the loop performs its first refresh immediately.
     app.state.refresh_task = asyncio.create_task(background_refresh_loop())
 
     yield
