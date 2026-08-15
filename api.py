@@ -24,7 +24,13 @@ import requests
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Query
 
-from signal_engine import analyze_symbol, max_analysis_bar_age_seconds
+from signal_engine import (
+    analyze_symbol,
+    format_expiry_label,
+    get_expiry_delta,
+    max_analysis_bar_age_seconds,
+    round_time_for_timeframe,
+)
 from news_context import get_news_context, news_settings
 
 
@@ -63,8 +69,12 @@ DEFAULT_TIMEFRAME = "1h"
 DEFAULT_DURATION_TYPE = "short"
 
 REFRESH_SECONDS = 10
+RECONCILE_SECONDS = int(os.environ.get("RECONCILE_SECONDS", "5"))
 WAITING_RETRY_SECONDS = 15
-ACTIVE_EXPIRE_GRACE_SECONDS = 65
+ACTIVE_EXPIRE_GRACE_SECONDS = int(os.environ.get("ACTIVE_EXPIRE_GRACE_SECONDS", "5"))
+WAITING_RESULT_MAX_AGE_SECONDS = int(
+    os.environ.get("WAITING_RESULT_MAX_AGE_SECONDS", "900")
+)
 MAX_HISTORY_ITEMS = 2000
 POSTGRES_STATEMENT_TIMEOUT_MS = 5000
 
@@ -102,6 +112,7 @@ active_signals: list[dict] = []
 signal_history: list[dict] = []
 
 refresh_lock = asyncio.Lock()
+reconcile_lock = threading.Lock()
 live_quote_cache: Dict[str, tuple[float, dict]] = {}
 live_quote_locks: Dict[str, threading.Lock] = {}
 market_data_forbidden_until = 0.0
@@ -998,9 +1009,24 @@ def add_signals_to_active(items: list[dict]) -> None:
             )
             continue
 
-        entry_time_iso = item.get("entry_time_iso")
-        if not entry_time_iso:
-            continue
+        # Analysis tasks finish at different times and the full scan can take
+        # longer than a minute. Schedule entry only after the signal has passed
+        # every filter, otherwise its original quote window may already be gone.
+        activation_time = datetime.now(timezone.utc)
+        entry_dt = round_time_for_timeframe(
+            activation_time,
+            str(item.get("timeframe") or DEFAULT_TIMEFRAME),
+        )
+        expiry_delta = get_expiry_delta(
+            str(item.get("timeframe") or DEFAULT_TIMEFRAME),
+            str(item.get("duration_type") or DEFAULT_DURATION_TYPE),
+        )
+        exit_dt = entry_dt + expiry_delta
+        item["entry_time"] = entry_dt.strftime("%H:%M")
+        item["exit_time"] = exit_dt.strftime("%H:%M")
+        item["entry_time_iso"] = entry_dt.isoformat().replace("+00:00", "Z")
+        item["exit_time_iso"] = exit_dt.isoformat().replace("+00:00", "Z")
+        item["recommended_expiry"] = format_expiry_label(expiry_delta)
 
         key = make_signal_key(item)
 
@@ -1167,6 +1193,27 @@ def update_waiting_history_results() -> bool:
         if item.get("result") != "WAITING_RESULT":
             continue
 
+        if not has_real_entry(item):
+            try:
+                entry_dt = parse_iso_utc(str(item.get("entry_time_iso") or ""))
+                entry_window_missed = (
+                    now_utc - entry_dt
+                ).total_seconds() > LIVE_QUOTE_MAX_AGE_SECONDS
+            except Exception:
+                entry_window_missed = True
+
+            if entry_window_missed:
+                signal_history[idx] = {
+                    **item,
+                    "result": "NO_RESULT",
+                    "outcome": None,
+                    "outcome_quality": "unverified_no_entry",
+                    "close_reason": "entry_snapshot_window_missed",
+                    "last_fact_retry_iso": now_iso(),
+                }
+                updated = True
+                continue
+
         last_retry_iso = item.get("last_fact_retry_iso")
         if last_retry_iso:
             try:
@@ -1179,6 +1226,26 @@ def update_waiting_history_results() -> bool:
         exit_price = get_latest_exit_price_for_item(item)
 
         if exit_price is None:
+            try:
+                exit_dt = parse_iso_utc(str(item.get("exit_time_iso") or ""))
+                exit_window_expired = (
+                    now_utc - exit_dt
+                ).total_seconds() > WAITING_RESULT_MAX_AGE_SECONDS
+            except Exception:
+                exit_window_expired = True
+
+            if exit_window_expired:
+                signal_history[idx] = {
+                    **item,
+                    "result": "NO_RESULT",
+                    "outcome": None,
+                    "outcome_quality": "unverified_no_exit",
+                    "close_reason": "exit_snapshot_window_missed",
+                    "last_fact_retry_iso": now_iso(),
+                }
+                updated = True
+                continue
+
             signal_history[idx]["last_fact_retry_iso"] = now_iso()
             updated = True
             continue
@@ -1207,14 +1274,20 @@ def update_waiting_history_results() -> bool:
     return updated
 
 
-def safe_reconcile_for_api(update_waiting: bool = False) -> None:
+def safe_reconcile_for_api(update_waiting: bool = False) -> bool:
+    if not reconcile_lock.acquire(blocking=False):
+        return False
     try:
         capture_due_entry_prices()
         update_closed_history_results()
         if update_waiting:
             update_waiting_history_results()
+        return True
     except Exception as e:
         logger.exception("API RECONCILE FAILED: %s", e)
+        return False
+    finally:
+        reconcile_lock.release()
 
 
 async def analyze_symbol_safe(symbol: str, timeframe: str, duration_type: str) -> dict:
@@ -1326,11 +1399,12 @@ async def refresh_all_signals() -> None:
             last_updated_at = now_iso()
             last_refresh_status = "ok"
 
-            add_signals_to_active(all_results)
-            deduplicate_active_signals()
-            capture_due_entry_prices()
-            update_closed_history_results()
-            update_waiting_history_results()
+            # The fast reconciliation loop owns active/history mutations and
+            # quote capture. Hold its lock only for the short in-memory add so
+            # the long analysis cycle cannot make us miss entry or exit time.
+            with reconcile_lock:
+                add_signals_to_active(all_results)
+                deduplicate_active_signals()
 
             elapsed = round(time.perf_counter() - started_at, 3)
             logger.info(
@@ -1360,6 +1434,16 @@ async def background_refresh_loop() -> None:
         await asyncio.sleep(REFRESH_SECONDS)
 
 
+async def background_reconcile_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(safe_reconcile_for_api, True)
+        except Exception as error:
+            logger.exception("Ошибка фоновой фиксации цен: %s", error)
+
+        await asyncio.sleep(RECONCILE_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -1386,16 +1470,23 @@ async def lifespan(app: FastAPI):
     # Do not block the ASGI startup on 64 network-heavy analyses. Render needs
     # the port to open quickly; the loop performs its first refresh immediately.
     app.state.refresh_task = asyncio.create_task(background_refresh_loop())
+    app.state.reconcile_task = asyncio.create_task(background_reconcile_loop())
 
     yield
 
-    refresh_task = getattr(app.state, "refresh_task", None)
-    if refresh_task:
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
+    background_tasks = [
+        getattr(app.state, "refresh_task", None),
+        getattr(app.state, "reconcile_task", None),
+    ]
+    for task in background_tasks:
+        if task:
+            task.cancel()
+    for task in background_tasks:
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="AutoSignal API", lifespan=lifespan)
@@ -1409,6 +1500,9 @@ def public_signal_settings() -> dict:
         "require_real_analysis_source": REQUIRE_REAL_ANALYSIS_SOURCE,
         "allowed_analysis_sources": sorted(ALLOWED_ANALYSIS_SOURCES),
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
+        "reconcile_seconds": RECONCILE_SECONDS,
+        "active_expire_grace_seconds": ACTIVE_EXPIRE_GRACE_SECONDS,
+        "waiting_result_max_age_seconds": WAITING_RESULT_MAX_AGE_SECONDS,
         "market_data_backoff_seconds": MARKET_DATA_BACKOFF_SECONDS,
         "analysis_bar_max_age_seconds": {
             timeframe: max_analysis_bar_age_seconds(timeframe)
@@ -1451,6 +1545,7 @@ def health():
     waiting_count = len([x for x in signal_history if x.get("result") == "WAITING_RESULT"])
     tp_count = len([x for x in signal_history if x.get("result") == "TP"])
     sl_count = len([x for x in signal_history if x.get("result") == "SL"])
+    no_result_count = len([x for x in signal_history if x.get("result") == "NO_RESULT"])
 
     return {
         "status": "ok",
@@ -1461,6 +1556,7 @@ def health():
         "history_waiting_count": waiting_count,
         "history_tp_count": tp_count,
         "history_sl_count": sl_count,
+        "history_no_result_count": no_result_count,
         "last_updated_at": last_updated_at,
         "last_refresh_status": last_refresh_status,
         "active_expire_grace_seconds": ACTIVE_EXPIRE_GRACE_SECONDS,
