@@ -49,6 +49,18 @@ TIMEFRAME_CONFIG = {
     "1d": {"fetch_interval": "1d", "period": "6mo", "resample": None},
 }
 
+# The newest aggregate must be recent enough to describe the market that is
+# being quoted now.  Generous limits allow for one still-forming candle while
+# rejecting delayed/free-plan feeds that can lag by many hours or a full day.
+ANALYSIS_BAR_MAX_AGE_SECONDS = {
+    "5m": 20 * 60,
+    "10m": 30 * 60,
+    "15m": 45 * 60,
+    "30m": 90 * 60,
+    "1h": 3 * 60 * 60,
+    "1d": 4 * 24 * 60 * 60,
+}
+
 MARKET_AGG_CONFIG = {
     "5m": (5, "minute"),
     "10m": (10, "minute"),
@@ -155,6 +167,50 @@ def normalize_duration_type(duration_type: str | None) -> str:
     if value in ("short", "long"):
         return value
     return DEFAULT_DURATION_TYPE
+
+
+def max_analysis_bar_age_seconds(timeframe: str) -> int:
+    timeframe = normalize_timeframe(timeframe)
+    return ANALYSIS_BAR_MAX_AGE_SECONDS[timeframe]
+
+
+def analysis_bar_age_seconds(
+    bar_time: Any,
+    at_utc: datetime | None = None,
+) -> float | None:
+    if bar_time is None:
+        return None
+    try:
+        timestamp = pd.Timestamp(bar_time)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        now_utc = (at_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        return max(0.0, (now_utc - timestamp.to_pydatetime()).total_seconds())
+    except Exception:
+        return None
+
+
+def analysis_data_is_fresh(
+    df: pd.DataFrame,
+    timeframe: str,
+    at_utc: datetime | None = None,
+) -> bool:
+    if df is None or df.empty:
+        return False
+
+    now_utc = (at_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    # No new forecast can become active while Forex is closed; keep the last
+    # chart visible until the next session instead of treating the weekend as
+    # a provider failure.
+    if not is_forex_market_open(now_utc):
+        return True
+
+    age_seconds = analysis_bar_age_seconds(df.index[-1], now_utc)
+    if age_seconds is None:
+        return False
+    return age_seconds <= max_analysis_bar_age_seconds(timeframe)
 
 
 def request_error_summary(error: Exception) -> str:
@@ -347,14 +403,24 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
     with _data_cache_lock:
         cached = _data_cache.get(cache_key)
         if cached and now_monotonic - cached[0] <= DATA_CACHE_TTL_SECONDS:
-            return cached[1].copy()
+            cached_df = cached[1].copy()
+            if analysis_data_is_fresh(cached_df, timeframe):
+                return cached_df
 
     days = period_to_days(TIMEFRAME_CONFIG[timeframe]["period"])
 
     try:
         market_df = _fetch_market_aggregates(symbol, timeframe, days)
         if market_df is not None and not market_df.empty:
-            return _cache_market_data(symbol, timeframe, market_df)
+            if analysis_data_is_fresh(market_df, timeframe):
+                return _cache_market_data(symbol, timeframe, market_df)
+            logger.warning(
+                "MARKET AGGREGATES STALE %s %s provider=%s age_seconds=%s",
+                symbol,
+                timeframe,
+                MARKET_DATA_PROVIDER,
+                round(analysis_bar_age_seconds(market_df.index[-1]) or 0),
+            )
     except Exception as error:
         record_market_data_failure(error)
         logger.warning(
@@ -366,7 +432,14 @@ def fetch_data(symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> pd.DataFrame 
 
     fallback_df = _fetch_yahoo_data(symbol, timeframe, days)
     if fallback_df is not None and not fallback_df.empty:
-        return _cache_market_data(symbol, timeframe, fallback_df)
+        if analysis_data_is_fresh(fallback_df, timeframe):
+            return _cache_market_data(symbol, timeframe, fallback_df)
+        logger.warning(
+            "YAHOO AGGREGATES STALE %s %s age_seconds=%s",
+            symbol,
+            timeframe,
+            round(analysis_bar_age_seconds(fallback_df.index[-1]) or 0),
+        )
     return None
 
 
@@ -1328,6 +1401,8 @@ def analyze_symbol(
     
     chart_points = CHART_POINTS_MAP.get(timeframe, 36)
     chart_df = signal_df.tail(chart_points)
+    analysis_bar_time = signal_df.index[-1]
+    analysis_age_seconds = analysis_bar_age_seconds(analysis_bar_time)
 
     price = float(last["Close"])
     rsi = float(last["RSI"])
@@ -1526,6 +1601,10 @@ def analyze_symbol(
         "strategy_signals": strategy_signals,
         "analysis_data_source": analysis_data_source,
         "analysis_bar_time_iso": chart_labels[-1] if chart_labels else None,
+        "analysis_bar_age_seconds": (
+            round(analysis_age_seconds) if analysis_age_seconds is not None else None
+        ),
+        "analysis_bar_max_age_seconds": max_analysis_bar_age_seconds(timeframe),
         "forecast_created_at_iso": datetime.now(timezone.utc).isoformat(),
         "candle_buy_bonus": candle_buy_bonus,
         "candle_sell_bonus": candle_sell_bonus,

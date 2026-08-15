@@ -24,7 +24,7 @@ import requests
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Query
 
-from signal_engine import analyze_symbol
+from signal_engine import analyze_symbol, max_analysis_bar_age_seconds
 from news_context import get_news_context, news_settings
 
 
@@ -924,6 +924,26 @@ def add_signals_to_active(items: list[dict]) -> None:
             )
             continue
 
+        try:
+            analysis_age = float(item.get("analysis_bar_age_seconds"))
+            analysis_max_age = max_analysis_bar_age_seconds(str(item.get("timeframe") or ""))
+        except (TypeError, ValueError):
+            analysis_age = None
+            analysis_max_age = None
+        if (
+            analysis_age is None
+            or analysis_max_age is None
+            or analysis_age > analysis_max_age
+        ):
+            logger.info(
+                "SIGNAL FILTERED BY STALE ANALYSIS: %s %s age=%s max_age=%s",
+                item.get("symbol"),
+                item.get("timeframe"),
+                analysis_age,
+                analysis_max_age,
+            )
+            continue
+
         if (
             item.get("price") is None
             or not item.get("live_quote_time_iso")
@@ -1390,6 +1410,10 @@ def public_signal_settings() -> dict:
         "allowed_analysis_sources": sorted(ALLOWED_ANALYSIS_SOURCES),
         "live_quote_max_age_seconds": LIVE_QUOTE_MAX_AGE_SECONDS,
         "market_data_backoff_seconds": MARKET_DATA_BACKOFF_SECONDS,
+        "analysis_bar_max_age_seconds": {
+            timeframe: max_analysis_bar_age_seconds(timeframe)
+            for timeframe in SCAN_TIMEFRAMES
+        },
         "experience_min_samples": EXPERIENCE_MIN_SAMPLES,
         "experience_prior_samples": EXPERIENCE_PRIOR_SAMPLES,
         "experience_max_adjustment": EXPERIENCE_MAX_ADJUSTMENT,
